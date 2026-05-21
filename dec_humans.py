@@ -155,6 +155,10 @@ HUMAN_CLASS = 0
 #  WEBCAM
 # ══════════════════════════════════════════════════════════════════════════════
 
+############################ IMPORTANT ##################################
+# CHECK THE DRONE IP FIRST BCZ NOT USING THIS CREATE A MISMATCH OR CRASH
+#########################################################################
+
 router_ip = get_router_ip()
 cap = cv2.VideoCapture(
     f"http://{router_ip}:3001",
