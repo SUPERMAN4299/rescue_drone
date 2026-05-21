@@ -88,6 +88,8 @@ drone/
 │   └── prop_check.py             # Property validation tests
 │
 └── README.md                      # This file
+├── analysing_cap.py               # analysing captures
+├── LISENCE                        # MIT lisence
 ```
 
 ---
@@ -111,10 +113,10 @@ drone/
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/SUPERMAN4299/drone
 cd drone
 
-# Navigate to Arduino firmware
+# Navigate to Arduino firmw1are
 cd ESP32-CAM_MJPEG2SD
 
 # Open in Arduino IDE:
