@@ -74,6 +74,19 @@ device_type, device_name, vram_gb = get_device()
 #  IP ADDRESS CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
+# RFC-1918 private ranges only.
+# Original regex r'(\d+\.\d+\.\d+\.\d+)' matches any four-octet string,
+# including firmware version numbers (e.g. "1.2.3.4"), NMEA sentences, etc.
+# Restricting to known LAN ranges eliminates those false positives.
+_PRIVATE_IP_RE = re.compile(
+    r'\b('
+    r'10\.\d{1,3}\.\d{1,3}\.\d{1,3}'
+    r'|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}'
+    r'|192\.168\.\d{1,3}\.\d{1,3}'
+    r')\b'
+)
+
+
 def get_drone_ip(com_port="COM5", baud_rate=115200, timeout_sec=30, max_attempts=None):
     """
     Read serial data from drone and extract router IP address.
@@ -103,7 +116,8 @@ def get_drone_ip(com_port="COM5", baud_rate=115200, timeout_sec=30, max_attempts
                 attempt += 1
                 if not line:
                     continue
-                match = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
+                # Use RFC-1918 restricted regex instead of the original broad pattern
+                match = _PRIVATE_IP_RE.search(line)
                 if match:
                     ip = match.group(1)
                     print(f"[IP Found] Got drone IP: {ip} (after {elapsed:.1f}s)")
@@ -164,57 +178,50 @@ HUMAN_CLASS = 0
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  VIDEO STREAM
-#  BUG 2 FIX: main.py reads from the *local* Flask MJPEG server (127.0.0.1:5000)
-#             NOT from the drone/router IP.  The drone IP from serial is only
-#             used to confirm the ESP32 is live on the network.
 # ══════════════════════════════════════════════════════════════════════════════
 
-STREAM_PORT       = 5000
+STREAM_PORT        = 5000
 MAX_STREAM_RETRIES = 3
 STREAM_RETRY_DELAY = 2
 
-# Confirm drone is online via serial (get_drone_ip returns the router IP the
-# ESP32 printed on its serial output; we don't connect OpenCV to that IP).
+stream_url = f"http://127.0.0.1:{STREAM_PORT}/"
+
+
+def open_stream(url, retries=MAX_STREAM_RETRIES, delay=STREAM_RETRY_DELAY):
+    """
+    Open the Flask MJPEG stream with retry logic.
+    Extracted into a helper so the same logic is reused for the initial
+    connection and automatic reconnection after a stream drop.
+    """
+    for attempt in range(retries):
+        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # keep buffer minimal for low latency
+        if cap.isOpened():
+            print(f"[Stream] ✅ Connected to {url}")
+            return cap
+        cap.release()
+        if attempt < retries - 1:
+            print(f"[Stream] Retry {attempt + 1}/{retries} in {delay}s…")
+            time.sleep(delay)
+    print(f"[Stream] Could not connect after {retries} attempts.")
+    return None
+
+
+# Confirm drone is online via serial before starting the main loop
 router_ip = get_drone_ip()
 if router_ip is None:
     print("[Main Error] Could not retrieve drone IP address from serial.")
     exit(1)
 
 print(f"[Serial] Drone reported IP: {router_ip}  (drone is online)")
-
-# BUG 2: stream from localhost where send_image_stream.py (Flask) is running
-stream_url = f"http://127.0.0.1:{STREAM_PORT}/"
 print(f"[Stream] Connecting to local Flask MJPEG at {stream_url}...")
 
-cap = None
-for attempt in range(MAX_STREAM_RETRIES):
-    try:
-        # BUG 9: set CAP_PROP_BUFFERSIZE immediately after construction, before read
-        cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # must be set before first read
-        if cap.isOpened():
-            print(f"[Stream] ✅ Connected to {stream_url}")
-            break
-        else:
-            cap.release()
-            cap = None
-            if attempt < MAX_STREAM_RETRIES - 1:
-                # BUG 10: denominator is MAX_STREAM_RETRIES, not MAX_STREAM_RETRIES-1
-                print(f"[Stream] Retry {attempt + 1}/{MAX_STREAM_RETRIES}... "
-                      f"(waiting {STREAM_RETRY_DELAY}s)")
-                time.sleep(STREAM_RETRY_DELAY)
-    except Exception as e:
-        print(f"[Stream Error] {e}")
-        if attempt < MAX_STREAM_RETRIES - 1:
-            print(f"[Stream] Retry {attempt + 1}/{MAX_STREAM_RETRIES}... "
-                  f"(waiting {STREAM_RETRY_DELAY}s)")
-            time.sleep(STREAM_RETRY_DELAY)
-
-if cap is None or not cap.isOpened():
-    print(f"[Main Error] Could not connect to video stream after {MAX_STREAM_RETRIES} attempts")
+cap = open_stream(stream_url)
+if cap is None:
+    print("[Main Error] Could not connect to video stream. Exiting.")
     exit(1)
 
-# Camera hints (may not apply to MJPEG HTTP, but harmless)
+# Resolution/FPS hints — may not apply to MJPEG HTTP, but are harmless
 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  cfg["cam_w"])
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg["cam_h"])
 cap.set(cv2.CAP_PROP_FPS, 30)
@@ -237,18 +244,18 @@ fps_val      = 0.0
 
 def draw_boxes(frame, boxes):
     """
-    BUG 13 FIX: Clamp label background Y so it never goes negative, which can
-    corrupt rendering or crash on some OpenCV builds.
+    Clamp label background Y so it never goes negative, which can corrupt
+    rendering or crash on some OpenCV builds.
     """
     for (x1, y1, x2, y2, conf, tid) in boxes:
         colour = (0, 220, 0)
         label  = (f"Human #{tid} ({conf:.0%})" if tid >= 0
                   else f"Human ({conf:.0%})")
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-        label_y_top = max(0, y1 - th - 10)          # clamp to frame top
+        label_y_top = max(0, y1 - th - 10)
         cv2.rectangle(frame, (x1, label_y_top), (x1 + tw + 6, y1), colour, -1)
         cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
-        text_y = max(th + 4, y1 - 4)                # clamp text baseline too
+        text_y = max(th + 4, y1 - 4)
         cv2.putText(frame, label, (x1 + 3, text_y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1)
 
@@ -258,13 +265,27 @@ def draw_boxes(frame, boxes):
 
 try:
     while True:
-        # BUG 9 FIX: grab() discards the oldest buffered frame so read() returns
-        # the freshest available frame, reducing display latency.
-        cap.grab()
-        ret, frame = cap.retrieve()
+        # cap.read() is the correct, portable call for a network MJPEG stream.
+        # The original grab() + retrieve() pattern is designed for multi-camera
+        # synchronisation with local cameras; its behaviour over CAP_FFMPEG HTTP
+        # streams is backend-dependent and can silently return stale frames.
+        # CAP_PROP_BUFFERSIZE=1 (set in open_stream) is sufficient to keep
+        # latency low without the grab/retrieve trick.
+        ret, frame = cap.read()
+
         if not ret:
-            print("[Main] Camera stream ended or disconnected")
-            break
+            # Stream dropped — attempt automatic reconnect instead of exiting.
+            print("[Main] Stream lost — attempting reconnect…")
+            cap.release()
+            cap = open_stream(stream_url)
+            if cap is None:
+                print("[Main] Could not reconnect. Exiting.")
+                break
+            # Pump the window event loop so the display does not freeze during
+            # reconnect attempts (waitKey must be called regularly on most
+            # platforms to keep the OpenCV window responsive).
+            cv2.waitKey(1)
+            continue
 
         frame_idx  += 1
         fps_frames += 1
@@ -319,9 +340,10 @@ try:
                 cached_boxes = new_boxes
 
             except Exception as e:
-                # BUG 11 FIX: Do NOT continue here.  Fall through so draw_boxes
-                # and imshow still run with the last good cached_boxes.
-                # Without this fix, any YOLO error freezes the display window.
+                # Do NOT continue here — fall through so draw_boxes and imshow
+                # still run using the last good cached_boxes.  Skipping imshow
+                # on a YOLO error would starve the window event loop and freeze
+                # the display.
                 print(f"[AI Error] Detection failed: {e}")
 
         draw_boxes(frame, cached_boxes)
@@ -342,6 +364,10 @@ try:
             y += 26
 
         cv2.imshow("Human Detection", frame)
+
+        # waitKey is called unconditionally at the end of every iteration,
+        # including after stream-reconnect continues, so the OpenCV window
+        # event loop is always serviced and the window never freezes.
         if cv2.waitKey(1) & 0xFF == ord('q'):
             print("[Main] User quit")
             break

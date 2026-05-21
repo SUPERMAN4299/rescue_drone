@@ -1,68 +1,71 @@
 import asyncio
 import os
 import websockets
-import cv2
-import numpy as np
-from io import BytesIO
 
-# ── Shared state ──────────────────────────────────────────────────────────────
-latest_frame = None
-IMAGE_PATH   = "image.jpg"
-TMP_PATH     = "image.jpg.tmp"
+# ── Paths ─────────────────────────────────────────────────────────────────────
+IMAGE_PATH = "image.jpg"
+TMP_PATH   = "image.jpg.tmp"
+
+
+# ── JPEG validity check ───────────────────────────────────────────────────────
+def _is_jpeg(data: bytes) -> bool:
+    """
+    Check JPEG SOI (FF D8) and EOI (FF D9) markers.
+    Fast — no decode; avoids importing cv2/numpy entirely.
+    """
+    return (len(data) >= 4
+            and data[:2]  == b'\xff\xd8'
+            and data[-2:] == b'\xff\xd9')
+
 
 # ── Frame handler ─────────────────────────────────────────────────────────────
 async def handle_connection(websocket):
     """
-    Receives binary JPEG frames from the ESP32 over WebSocket.
+    Receives binary JPEG frames from the ESP32 over WebSocket and writes
+    them atomically to image.jpg for Flask to serve.
 
-    Fixes applied:
-      - BUG 3 / BUG 4 : Write decoded frame to image.jpg atomically
-                         (write to .tmp then os.replace) to prevent Flask
-                         reading a half-written file.
-      - BUG 7          : Removed is_valid_image() double-decode; cv2.imdecode
-                         returns None on failure — that is sufficient.
-      - BUG 8          : Added bare except inside the loop so a single bad frame
-                         (corrupt JPEG, numpy error, OS write error) does NOT
-                         kill the entire connection handler.
+    Key fixes vs original:
+      - Removed latest_frame (assigned but never read anywhere).
+      - Removed cv2 / numpy / BytesIO imports (nothing needs them here).
+      - Eliminated decode→re-encode round-trip: ESP32 already sends valid
+        JPEG; writing raw bytes preserves quality and removes CPU overhead.
+      - Validity is checked via JPEG SOI/EOI markers instead of a full decode.
+      - os.fsync() ensures bytes are flushed to disk before os.replace(),
+        preventing a corrupt image.jpg on crash or power loss.
+      - Per-frame bare except kept so one bad frame never kills the handler.
     """
-    global latest_frame
     print("[WS] ESP32 Connected")
 
     while True:
         try:
             message = await websocket.recv()
 
-            # Skip obviously too-small payloads (noise / control messages)
+            # Skip obviously too-small payloads (noise / handshake messages)
             if len(message) < 5000:
                 continue
 
-            # Single decode — if it fails, imdecode returns None
-            np_arr = np.frombuffer(message, np.uint8)
-            frame  = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-            if frame is None:
-                # Not a valid JPEG — skip silently
+            # Validate JPEG markers — skip silently if malformed
+            if not _is_jpeg(message):
+                print("[WS] Skipping invalid JPEG frame (bad SOI/EOI markers)")
                 continue
 
-            latest_frame = frame
-
-            # ── Atomic write to disk (BUG 3 + BUG 4) ─────────────────────────
-            # Re-encode to JPEG and write to a temp file, then rename.
-            # os.replace() is atomic on POSIX and effectively atomic on Windows
+            # ── Atomic write to disk ──────────────────────────────────────────
+            # Write raw ESP32 JPEG bytes directly — no decode/re-encode.
+            # os.replace() is atomic on POSIX and near-atomic on Windows
             # (same-filesystem rename), so Flask never sees a partial file.
-            ret, buf = cv2.imencode('.jpg', frame,
-                                    [cv2.IMWRITE_JPEG_QUALITY, 85])
-            if ret:
-                with open(TMP_PATH, 'wb') as f:
-                    f.write(buf.tobytes())
-                os.replace(TMP_PATH, IMAGE_PATH)
+            with open(TMP_PATH, 'wb') as f:
+                f.write(message)
+                f.flush()
+                os.fsync(f.fileno())   # flush kernel buffers before rename
+            os.replace(TMP_PATH, IMAGE_PATH)
 
         except websockets.exceptions.ConnectionClosed:
             print("[WS] Disconnected")
             break
 
         except Exception as e:
-            # BUG 8: catch all other per-frame errors; log and continue
+            # Catch all per-frame errors; log and continue so one bad frame
+            # (OS write error, etc.) does NOT kill the entire connection.
             print(f"[WS] Frame handling error: {e}")
             continue
 
