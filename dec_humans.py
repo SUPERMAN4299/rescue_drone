@@ -3,6 +3,7 @@ import cv2
 import torch
 import subprocess
 import platform
+import re
 from collections import defaultdict
 import time
 
@@ -78,6 +79,34 @@ def get_device():
 device_type, device_name, vram_gb = get_device()
 
 # ══════════════════════════════════════════════════════════════════════════════
+# IP ADRESS CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_router_ip():
+    try:
+        # Run ipconfig command
+        output = subprocess.check_output("ipconfig", text=True)
+
+        # Find Default Gateway
+        matches = re.findall(r"Default Gateway[ .:]*([\d.]+)", output)
+
+        for ip in matches:
+            if ip.strip():
+                return ip
+
+    except Exception as e:
+        print("Error:", e)
+
+    return None
+
+router_ip = get_router_ip()
+
+if router_ip:
+    print("Router IP:", router_ip)
+else:
+    print("Router IP not found")
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  ADAPTIVE CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -126,7 +155,19 @@ HUMAN_CLASS = 0
 #  WEBCAM
 # ══════════════════════════════════════════════════════════════════════════════
 
-cap = cv2.VideoCapture(0)
+router_ip = get_router_ip()
+cap = cv2.VideoCapture(
+    f"http://{router_ip}:3001",
+    cv2.CAP_FFMPEG
+)
+
+if not cap.isOpened():
+    print("Error: Could not open video stream")
+    exit()
+
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce latency by keeping only the latest frame in buffer
+
+# camera settings
 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  cfg["cam_w"])
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg["cam_h"])
 cap.set(cv2.CAP_PROP_FPS, 30)
