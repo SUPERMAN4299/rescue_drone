@@ -73,30 +73,6 @@ The system consists of three interconnected components:
 drone/
 ├── analysing.py                    # Main YOLOv8 analysis script with auto GPU detection
 ├── yolov8n.pt                      # YOLOv8 Nano model (pre-trained weights)
-│
-├── ESP32-CAM_MJPEG2SD/            # Arduino firmware for ESP32-CAM
-│   ├── ESP32-CAM_MJPEG2SD.ino    # Main firmware entry point
-│   ├── appGlobals.h               # Configuration and feature flags
-│   ├── camera_pins.h              # Camera pin definitions
-│   ├── mjpeg2sd.cpp               # Core MJPEG recording logic
-│   ├── motionDetect.cpp           # Motion detection algorithms
-│   ├── rtsp.cpp                   # RTSP server implementation
-│   ├── mqtt.cpp                   # MQTT protocol handler
-│   ├── webServer.cpp              # Web interface
-│   ├── streamServer.cpp           # MJPEG streaming server
-│   ├── audio.cpp                  # Audio recording from microphone
-│   ├── telemetry.cpp              # Sensor telemetry logging
-│   ├── telegram.cpp               # Telegram bot notifications
-│   ├── ftp.cpp                    # FTP file transfer
-│   ├── webDav.cpp                 # WebDAV server
-│   ├── utils.cpp                  # General utilities
-│   ├── utilsFS.cpp                # Filesystem utilities
-│   ├── utilsLog.cpp               # Logging utilities
-│   └── data/                       # Web interface files
-│       ├── MJPEG2SD.htm           # Main dashboard HTML
-│       ├── Auxil.htm              # Auxiliary controls
-│       └── common.js              # Shared JavaScript
-│
 ├── esp32cam-stream/               # Python streaming system
 │   ├── websocket_camera_stream.ino # WebSocket camera code
 │   ├── requirements.txt            # Python dependencies
