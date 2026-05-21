@@ -33,7 +33,7 @@
 const char* ssid     = WIFI_SSID; // CHANGE HERE
 const char* password = WIFI_PASSWORD; // CHANGE HERE
 
-const char* websockets_server_host = "192.168.1.149"; //CHANGE HERE
+const char* websockets_server_host = "192.168.1.149"; //LAPTOP IP
 const uint16_t websockets_server_port = 3001; // OPTIONAL CHANGE
 
 camera_fb_t * fb = NULL;

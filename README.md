@@ -404,18 +404,22 @@ python esp32cam-stream/stream/receive_stream.py
 
 **Problem:** `Failed to connect`
 - **Solution:** 
-  - Ensure IO0 is connected to GND
+  - Ensure IO0 is connected to GND during flashing
   - Try different USB cable (data cable, not charge-only)
   - Use Arduino IDE Serial Monitor to verify connection: 115200 baud
+  - Reset board with power cycle: unplug USB, wait 2 seconds, reconnect
+  - Update CH340 driver if using clones
 
 ### No Video Stream
 
 **Problem:** `Connection refused` or `Frame loss`
 - **Solution:**
   - Verify WiFi connection: check ESP32-CAM dashboard at `http://<esp32-ip>`
-  - Ensure PC and ESP32-CAM are on same network
-  - Check firewall: allow port 8765 (WebSocket)
-  - Reduce resolution if bandwidth limited
+  - Ensure PC and ESP32-CAM are on same network (not VPN/guest network)
+  - Check firewall: allow port 8765 (WebSocket) and 8000 (HTTP)
+  - Reduce resolution if bandwidth limited: use QVGA instead of SVGA
+  - Restart both WebSocket server and ESP32-CAM
+  - Check router WiFi interference: switch to 2.4GHz only (ESP32-CAM limitation)
 
 ### YOLOv8 Slow / High Latency
 
@@ -425,15 +429,121 @@ python esp32cam-stream/stream/receive_stream.py
   - Reduce image size: use `imgsz=320` for faster inference
   - Use smaller model: switch to `yolov8s.pt` or `yolov8n.pt`
   - Verify GPU is being used: check console output for device type
+  - Close other GPU-intensive applications (Chrome, games, etc.)
+  - Check GPU temperature: may be thermal throttling if >80°C
 
 ### Serial Port Issues
 
 **Problem:** `Failed to open serial port COM5`
 - **Solution:**
   - Verify correct COM port: check Device Manager
-  - Ensure no other application has port open
+  - Ensure no other application has port open (Arduino IDE, PuTTY)
   - Try different baud rates (default: 115200)
-  - Check USB driver installation
+  - Check USB driver installation: CH340 or FTDI driver
+  - Uninstall and reinstall USB drivers if corrupted
+
+### GPU Not Detected
+
+**Problem:** Using CPU instead of GPU, output shows `device: cpu`
+- **Solution:**
+  - Verify GPU drivers are installed: NVIDIA/AMD/Intel drivers up-to-date
+  - Check CUDA installation: `python -c "import torch; print(torch.cuda.is_available())"`
+  - For NVIDIA: ensure CUDA 11.8+ and cuDNN installed
+  - Restart Python environment after driver installation
+  - Check available VRAM: `nvidia-smi` command (NVIDIA)
+  - Try explicit device: modify `analysing.py` with `device='cuda'`
+
+### Out of Memory Error
+
+**Problem:** `RuntimeError: CUDA out of memory` or `MemoryError`
+- **Solution:**
+  - Reduce batch size in `analysing.py`: `batch=1`
+  - Switch to smaller model: `yolov8n.pt` (nano) or `yolov8s.pt` (small)
+  - Lower image resolution: use `imgsz=320` instead of 640
+  - Clear GPU cache: restart Python script between runs
+  - Check VRAM usage: `nvidia-smi` (NVIDIA) or Task Manager (AMD)
+  - For CPU: increase system RAM available or close background applications
+
+### Model Loading Error
+
+**Problem:** `ModuleNotFoundError` or `FileNotFoundError: yolov8n.pt`
+- **Solution:**
+  - Ensure `yolov8n.pt` exists in project root: `f:\drone\yolov8n.pt`
+  - Verify model downloaded correctly: file size should be >40MB
+  - Check file permissions: read access required
+  - Re-download if corrupted: `python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"`
+  - Verify YOLO installation: `pip install ultralytics==8.0.0` or later
+
+### WiFi Keeps Disconnecting
+
+**Problem:** `Connection lost` or `Reconnecting...`
+- **Solution:**
+  - Check WiFi signal strength: move ESP32-CAM closer to router
+  - Reduce transmit power loss: use 2.4GHz band (5GHz has poor range)
+  - Disable WiFi power saving on router if available
+  - Increase WiFi timeout in firmware: edit `globals.h` → `WIFI_TIMEOUT`
+  - Check for interference: microwaves, Bluetooth, cordless phones
+  - Use static IP instead of DHCP for stability
+  - Monitor logs for "brownout detector triggered" (power supply issue)
+
+### Camera Not Initializing
+
+**Problem:** Black screen or `Camera init failed`
+- **Solution:**
+  - Verify correct camera model selected in `appGlobals.h`
+  - Check I2C connection: SDA/SCL pins properly wired
+  - Inspect camera module for physical damage or dust
+  - Ensure camera ribbon cable fully inserted and aligned
+  - Try different camera model definition as fallback
+  - Reset camera with power cycle: full system restart
+  - Check power supply: ESP32-CAM needs 3.3V @ 160mA stable
+
+### SD Card Issues
+
+**Problem:** `No SD card detected` or `Write failed`
+- **Solution:**
+  - Use Class 10 microSD card for reliable performance
+  - Format SD card as FAT32 in Windows Explorer
+  - Check SD card inserted fully and making contact
+  - Test card in another device to verify functionality
+  - Enable SD card in firmware: check `globals.h` SD_MMC settings
+  - Monitor free space: delete old videos if drive full
+  - Use USB adapter for reliable reading on PC
+
+### MQTT Connection Failed
+
+**Problem:** `MQTT connection refused` or `Timeout`
+- **Solution:**
+  - Verify MQTT broker is running and accessible: `mqtt-8883` or `1883` port
+  - Check firewall rules: allow MQTT port (usually 1883)
+  - Verify credentials: username/password in firmware correct
+  - Check MQTT broker logs for authentication errors
+  - Use public broker for testing: `mqtt.eclipse.org` (port 1883)
+  - Ensure PC and ESP32-CAM can communicate: ping test first
+
+### Telegram Alerts Not Received
+
+**Problem:** No notifications in Telegram or `Bot init failed`
+- **Solution:**
+  - Verify Bot Token correct: obtain from BotFather on Telegram
+  - Check Chat ID correct: send `/start` to bot to get chat ID
+  - Ensure motion detection is enabled: PIR sensor or frame diff
+  - Check internet connection on ESP32-CAM: verify WiFi connected
+  - Monitor Telegram bot logs for error messages
+  - Test with simple text message first, then image attachment
+  - Rate limit: Telegram may block rapid messages (>30/min)
+
+### Frame Rate Lower Than Expected
+
+**Problem:** Getting 5-10 FPS instead of 15-30 FPS
+- **Solution:**
+  - Check WiFi signal quality: RSSI value in ESP32-CAM logs
+  - Reduce frame resolution: SVGA(800x600) slower than QVGA(320x240)
+  - Lower JPEG quality in firmware: `#define JPEG_QUALITY 8` (lower = faster)
+  - Check CPU load: other processes consuming resources
+  - Monitor WiFi bandwidth: use network analyzer
+  - For OV2640: maximum theoretical FPS is 15 at SVGA
+  - Consider upgrading to OV3660/OV5640 for higher frame rates
 
 ---
 
