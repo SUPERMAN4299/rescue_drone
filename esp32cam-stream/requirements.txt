@@ -1,0 +1,6 @@
+pillow
+websocket-client
+websocket-server
+websocket
+flask
+asyncio
