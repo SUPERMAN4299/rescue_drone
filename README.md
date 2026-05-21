@@ -7,7 +7,7 @@ A drone camera system using ESP32-CAM with MJPEG streaming and telemetry capabil
 ### 📁 **ESP32-CAM_MJPEG2SD**
 Arduino firmware for ESP32-CAM that captures video frames to SD card with MJPEG format and various connectivity options (WiFi, RTSP, MQTT, WebDAV, etc.).
 
-**Setup:** See [esp32_READme.md](esp32_READme.md) for detailed configuration and flashing instructions.
+**Setup:** See [esp32_READme.md](esp32_READme.md) in folder of esp32cam-stream for detailed configuration and flashing instructions.
 
 ### 📁 **esp32cam-stream**
 Python-based streaming system for real-time camera feed transmission via WebSocket.
