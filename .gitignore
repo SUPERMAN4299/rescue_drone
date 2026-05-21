@@ -6,3 +6,4 @@
 *.pyd
 *.zip
 /ESP32-CAM_MJPEG2SD
+*.pt
