@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <ArduinoWebsockets.h>
 #include "esp_timer.h"
+#include "wifi_config.h"
 #include "img_converters.h"
 #include "fb_gfx.h"
 #include "soc/soc.h" //disable brownout problems
@@ -29,8 +30,8 @@
 
 
 
-const char* ssid     = "network-name"; // CHANGE HERE
-const char* password = "network-password"; // CHANGE HERE
+const char* ssid     = WIFI_SSID; // CHANGE HERE
+const char* password = WIFI_PASSWORD; // CHANGE HERE
 
 const char* websockets_server_host = "192.168.1.149"; //CHANGE HERE
 const uint16_t websockets_server_port = 3001; // OPTIONAL CHANGE
