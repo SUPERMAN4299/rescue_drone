@@ -134,23 +134,79 @@ def get_drone_ip(com_port="COM5", baud_rate=115200, timeout_sec=30, max_attempts
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_config(device_type, vram_gb):
-    if device_type == "cuda":
-        if vram_gb >= 8:
-            return dict(model="yolov8x.pt", imgsz=960,  conf=0.50, iou=0.40,
-                        skip=1, smooth=2, half=True,  device="cuda",
-                        cam_w=1920, cam_h=1080, tier="High-end GPU (CUDA)")
-        elif vram_gb >= 4:
-            return dict(model="yolov8m.pt", imgsz=640,  conf=0.50, iou=0.40,
-                        skip=1, smooth=2, half=True,  device="cuda",
-                        cam_w=1280, cam_h=720,  tier="Mid-range GPU (CUDA)")
-        else:
-            return dict(model="yolov8s.pt", imgsz=640,  conf=0.45, iou=0.45,
-                        skip=1, smooth=3, half=True,  device="cuda",
-                        cam_w=1280, cam_h=720,  tier="Low-VRAM GPU (CUDA)")
 
-    return dict(model="yolov8n.pt", imgsz=320,  conf=0.45, iou=0.45,
-                skip=2, smooth=3, half=False, device="cpu",
-                cam_w=640,  cam_h=480,  tier=f"CPU ({device_name})")
+    # ─────────────────────────────────────────────────────────────
+    # NVIDIA CUDA GPUs
+    # ─────────────────────────────────────────────────────────────
+    if device_type == "cuda":
+
+        # High-End GPU (RTX 3070/3080/3090 etc.)
+        if vram_gb >= 8:
+            return dict(
+                model="yolov8x.pt",
+                imgsz=960,
+                conf=0.30,
+                iou=0.45,
+                skip=1,
+                smooth=2,
+                half=True,
+                device="cuda",
+                cam_w=1920,
+                cam_h=1080,
+                tier="High-end GPU (CUDA)"
+            )
+
+        # Mid-Range GPU (GTX 1660 / RTX 2060 etc.)
+        elif vram_gb >= 4:
+            return dict(
+                model="yolov8m.pt",
+                imgsz=640,
+                conf=0.25,
+                iou=0.45,
+                skip=1,
+                smooth=2,
+                half=True,
+                device="cuda",
+                cam_w=1280,
+                cam_h=720,
+                tier="Mid-range GPU (CUDA)"
+            )
+
+        # Low VRAM GPU
+        else:
+            return dict(
+                model="yolov8s.pt",
+                imgsz=640,
+                conf=0.25,
+                iou=0.45,
+                skip=1,
+                smooth=3,
+                half=True,
+                device="cuda",
+                cam_w=1280,
+                cam_h=720,
+                tier="Low-VRAM GPU (CUDA)"
+            )
+
+    # ─────────────────────────────────────────────────────────────
+    # CPU MODE (Optimized)
+    # ─────────────────────────────────────────────────────────────
+    return dict(
+        model="yolov8s.pt",      # Better than yolov8n
+        imgsz=640,               # Better detection range
+        conf=0.25,               # More sensitive detection
+        iou=0.45,
+        skip=2,                  # AI every 2nd frame for CPU speed
+        smooth=2,                # Faster stable tracking
+        half=False,
+        device="cpu",
+
+        # Stream resolution
+        cam_w=1280,
+        cam_h=720,
+
+        tier=f"CPU ({device_name})"
+    )
 
 
 cfg = build_config(device_type, vram_gb)
@@ -208,10 +264,14 @@ def open_stream(url, retries=MAX_STREAM_RETRIES, delay=STREAM_RETRY_DELAY):
 
 
 # Confirm drone is online via serial before starting the main loop
-router_ip = get_drone_ip()
-if router_ip is None:
-    print("[Main Error] Could not retrieve drone IP address from serial.")
-    exit(1)
+# I M COMMENTING THIS FOR TEST PURPOSE ONLY router_ip = get_drone_ip()
+# I M COMMENTING THIS FOR TEST PURPOSE ONLY if router_ip is None:
+# I M COMMENTING THIS FOR TEST PURPOSE ONLY     print("[Main Error] Could not retrieve drone IP address from serial.")
+# I M COMMENTING THIS FOR TEST PURPOSE ONLY     exit(1)
+
+# THE CODE OF 2 LINE WRITTEN BELOW IS JUST TESTPURPOSE ONLY
+router_ip = "127.0.0.1"
+print(f"[Serial] Fake drone IP: {router_ip}")
 
 print(f"[Serial] Drone reported IP: {router_ip}  (drone is online)")
 print(f"[Stream] Connecting to local Flask MJPEG at {stream_url}...")

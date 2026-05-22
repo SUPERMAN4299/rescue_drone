@@ -3,7 +3,8 @@ import os
 import websockets
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-IMAGE_PATH = "image.jpg"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+IMAGE_PATH = os.path.join(BASE_DIR, "image.jpg")
 TMP_PATH   = "image.jpg.tmp"
 
 
@@ -40,8 +41,10 @@ async def handle_connection(websocket):
         try:
             message = await websocket.recv()
 
+            print(f"[WS] Frame received: {len(message)} bytes")
+
             # Skip obviously too-small payloads (noise / handshake messages)
-            if len(message) < 5000:
+            if len(message) < 1000:
                 continue
 
             # Validate JPEG markers — skip silently if malformed
@@ -53,11 +56,14 @@ async def handle_connection(websocket):
             # Write raw ESP32 JPEG bytes directly — no decode/re-encode.
             # os.replace() is atomic on POSIX and near-atomic on Windows
             # (same-filesystem rename), so Flask never sees a partial file.
-            with open(TMP_PATH, 'wb') as f:
-                f.write(message)
-                f.flush()
-                os.fsync(f.fileno())   # flush kernel buffers before rename
-            os.replace(TMP_PATH, IMAGE_PATH)
+            # Direct write (stable on Windows)
+            try:
+                with open(IMAGE_PATH, 'wb') as f:
+                    f.write(message)
+            
+            except Exception as e:
+                print(f"[WS] Save error: {e}")
+                continue
 
         except websockets.exceptions.ConnectionClosed:
             print("[WS] Disconnected")

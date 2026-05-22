@@ -3,9 +3,11 @@ import time
 from flask import Flask, Response
 
 app = Flask(__name__)
-
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+IMAGE_PATH = os.path.join(BASE_DIR, "image.jpg")
+PLACEHOLDER_PATH = os.path.join(BASE_DIR, "placeholder.jpg")
 # ── Config ────────────────────────────────────────────────────────────────────
-TARGET_FPS     = 25
+TARGET_FPS     = 12
 FRAME_INTERVAL = 1.0 / TARGET_FPS   # seconds between yields (~40 ms)
 
 # ── Frame cache ───────────────────────────────────────────────────────────────
@@ -44,14 +46,14 @@ def get_image():
 
         # ── Try to serve the latest live frame ────────────────────────────────
         try:
-            mtime = os.path.getmtime("image.jpg")
+            mtime = os.path.getmtime(IMAGE_PATH)
 
             if mtime != _last_mtime:
                 # File has been updated — read it (with one retry on failure)
                 img_bytes = b''
                 for _ in range(2):
                     try:
-                        with open("image.jpg", "rb") as f:
+                        with open(IMAGE_PATH, "rb", buffering=0) as f:
                             img_bytes = f.read()
                         break
                     except OSError:
@@ -74,7 +76,7 @@ def get_image():
         # ── Fall back to placeholder if live frame failed ─────────────────────
         if not frame_sent:
             try:
-                with open("placeholder.jpg", "rb") as f:
+                with open(PLACEHOLDER_PATH, "rb") as f:
                     placeholder_bytes = f.read()
                 if len(placeholder_bytes) > 4 and placeholder_bytes[:2] == b'\xff\xd8':
                     yield (b'--frame\r\n'
