@@ -7,37 +7,29 @@ A comprehensive embedded vision system combining ESP32-CAM hardware with real-ti
 ## ✨ Key Features
 
 ### 🎥 **Hardware & Capture**
-- **ESP32-CAM Module** with multiple camera sensor support (OV2640, OV3660, OV5640)
-- **MJPEG2SD Firmware** for high-speed video recording to SD card in AVI format
-- Support for **SVGA (800×600) @ 15fps** or QVGA (320×240) @ 30fps streaming
-- Built-in **motion detection** via PIR sensors, radar, or accelerometer
-- **Audio recording** support from I2S or PDM microphones
-- Concurrent streaming to web browser and remote NVR via RTSP
+- Multiple camera sensors (OV2640, OV3660, OV5640)
+- MJPEG2SD firmware with SD card recording & motion detection
+- SVGA (800×600) @ 15fps or QVGA (320×240) @ 30fps streaming
+- Audio recording & RTSP streaming
 
 ### 🤖 **AI & Computer Vision**
-- **YOLOv8 Real-time Object Detection** with adaptive model selection based on GPU
-- **Human detection & tracking** with unique ID assignment
-- **Frame-skipping optimization** for CPU systems
-- **Smoothing filters** to reduce jitter in detection results
-- GPU acceleration support (NVIDIA CUDA, AMD, Intel Arc)
-- Multi-tier configuration (CPU, Low-VRAM GPU, Mid-range GPU, High-end GPU)
+- YOLOv8 real-time object detection with auto GPU detection
+- Human detection & tracking with unique ID assignment
+- GPU acceleration (NVIDIA, AMD, Intel Arc)
+- Frame-skipping & jitter reduction
 
 ### 🌐 **Connectivity & Streaming**
-- **WebSocket-based streaming** for real-time video transmission
-- **WiFi integration** with static IP configuration
-- **RTSP server** for compatible media players
-- **MQTT control** with Home Assistant integration
-- **FTP, WebDAV, HTTPS** file transfer options
-- **Telegram Bot** notifications and alert system
-- **Web dashboard** for configuration and monitoring
+- WebSocket, RTSP, MQTT, WiFi & serial communication
+- Home Assistant integration & Telegram alerts
+- FTP, WebDAV, HTTPS file transfer
+- Web dashboard for configuration
 
 ### 🛠️ **Advanced Features**
-- **Telemetry recording** during video capture
+- **Telemetry recording** & sensor fusion (gyro + accelerometer)
 - **Serial communication** with drone flight controllers
 - **PID controller simulation** for motion control tuning
-- **Sensor fusion** combining gyroscope and accelerometer data
-- **Automatic GPU detection** with fallback to CPU
-- **OTA (Over-The-Air) firmware updates**
+- **Automatic GPU detection** with CPU fallback
+- **OTA firmware updates**
 
 ---
 
@@ -71,26 +63,25 @@ The system consists of three interconnected components:
 
 ```
 drone/
-├── analysing.py                    # Main YOLOv8 analysis script with auto GPU detection
-├── yolov8n.pt                      # YOLOv8 Nano model (pre-trained weights)
-├── esp32cam-stream/               # Python streaming system
+├── analysing.py                    # Main YOLOv8 analysis script
+├── analysing_cap.py                # Analyze saved captures
+├── launcher.py                     # Run the pipeline
+├── test_cam.py                     # Test detection without ESP32
+├── yolov8n.pt                      # YOLOv8 Nano model weights
+├── LICENSE                         # MIT License
+├── esp32cam-stream/                # Python streaming system
 │   ├── websocket_camera_stream.ino # WebSocket camera code
-│   ├── requirements.txt            # Python dependencies
-│   ├── extract_wifi.py            # Windows WiFi credential extractor
-│   ├── esp32_READme.md            # Setup and flashing guide
+│   ├── requirements.txt
+│   ├── extract_wifi.py             # Extract Windows WiFi credentials
+│   ├── esp32_READme.md             # Setup & flashing guide
 │   └── stream/
-│       ├── send_image_stream.py   # Client: Sends images via WebSocket
-│       └── receive_stream.py      # Server: Receives and displays stream
-│
-├── tests/                         # Testing & Simulation tools
-│   ├── gyro_acc.py               # MPU6050 sensor fusion simulator
-│   ├── pid_simulator.py          # PID controller tuning simulator
-│   └── prop_check.py             # Property validation tests
-│
-└── README.md                      # This file
-├── analysing_cap.py               # analysing captures and human detection
-└── test_cam.py                   # For testing detection (without ESP)
-├── LISENCE                        # MIT lisence
+│       ├── send_image_stream.py
+│       └── receive_stream.py
+├── ESP32-CAM_MJPEG2SD/             # Firmware & hardware code
+└── tests/                          # Testing tools
+    ├── gyro_acc.py                 # Sensor fusion simulator
+    ├── pid_simulator.py            # PID tuning simulator
+    └── prop_check.py               # Property validation
 ```
 
 ---
@@ -99,38 +90,22 @@ drone/
 
 ### Prerequisites
 
-- **Hardware:**
-  - ESP32-CAM board (or ESP32-S3 for better performance)
-  - microSD card (Class 10 recommended)
-  - USB cable for programming
-  - (Optional) Microphone, PIR sensor, servo motors
-
-- **Software:**
-  - Python 3.8+
-  - Arduino IDE (v2.0+)
-  - git
+- **Hardware:** ESP32-CAM, microSD card, USB cable
+- **Software:** Python 3.8+, Arduino IDE v2.0+, git
 
 ### 1️⃣ Hardware Setup (ESP32-CAM)
 
 ```bash
-# Clone the repository
 git clone https://github.com/SUPERMAN4299/drone
-cd drone
+cd drone/ESP32-CAM_MJPEG2SD
 
-# Navigate to Arduino firmw1are
-cd ESP32-CAM_MJPEG2SD
-
-# Open in Arduino IDE:
-# 1. File → Open → ESP32-CAM_MJPEG2SD.ino
-# 2. Edit appGlobals.h:
-#    - Select your camera model: CAMERA_MODEL_AI_THINKER
-#    - Enable desired features (INCLUDE_MQTT, INCLUDE_TELEGRAM, etc.)
+# In Arduino IDE:
+# 1. Open ESP32-CAM_MJPEG2SD.ino
+# 2. Edit appGlobals.h: Select camera (CAMERA_MODEL_AI_THINKER)
 # 3. Tools → Board → ESP32 Dev Module
-# 4. Tools → Partition Scheme → Minimal SPIFFS (...)
-# 5. Connect ESP32-CAM via USB
-# 6. Connect IO0 to GND for flashing
-# 7. Click Upload
-# 8. After upload, disconnect IO0 and press Reset
+# 4. Tools → Partition Scheme → Minimal SPIFFS
+# 5. Connect ESP32-CAM, tie IO0 to GND for flashing
+# 6. Upload & press Reset
 ```
 
 ### 2️⃣ Python Environment Setup
@@ -138,45 +113,35 @@ cd ESP32-CAM_MJPEG2SD
 ```bash
 # Create virtual environment
 python -m venv venv
-source venv/Scripts/activate  # Windows
+venv\Scripts\activate  # Windows
 # or: source venv/bin/activate  # Linux/Mac
 
 # Install dependencies
 pip install -r esp32cam-stream/requirements.txt
-
-# Verify installations
-python -c "import cv2; import torch; from ultralytics import YOLO; print('✅ All packages installed')"
 ```
 
 ### 3️⃣ Configuration
 
+**Auto WiFi Config (Windows):**
 ```bash
-# Extract WiFi credentials (Windows only)
 python esp32cam-stream/extract_wifi.py
-
-# Or manually configure WiFi:
-# - Connect to ESP32-CAM's AP: "ESP-CAM_MJPEG_..."
-# - Open browser: 192.168.4.1
-# - Configure WiFi SSID and password
-# - Set static IP (e.g., 192.168.1.100)
 ```
+
+**Manual WiFi Config:**
+- Connect to ESP32-CAM AP: `ESP-CAM_MJPEG_...`
+- Browser: `192.168.4.1`
+- Set SSID, password & static IP
 
 ### 4️⃣ Start Streaming & Analysis
 
-**Terminal 1 - WebSocket Server:**
+**Terminal 1:**
 ```bash
 python esp32cam-stream/stream/receive_stream.py
-# Output: "WebSocket server started on ws://0.0.0.0:8765"
 ```
 
-**Terminal 2 - YOLOv8 Analysis:**
+**Terminal 2:**
 ```bash
 python analysing.py
-# Output: 
-# [Device] ✅ NVIDIA CUDA GPU: NVIDIA RTX 3080 (10.0 GB VRAM)
-# [Stream] ✅ Connected to http://127.0.0.1:5000/
-# [Model] ✅ Loaded yolov8m.pt on cuda
-# Frame #1: 2 humans detected @ 45 FPS
 ```
 
 ---
@@ -233,318 +198,68 @@ const int websocket_port = 8765;
 
 ---
 
-## 📊 Performance Benchmarks
+## 🛠️ Utility Commands
 
-### Frame Processing Rates (OV2640 Camera)
+### Kill Running Processes
+```bash
+# Stop Python
+taskkill /F /IM python.exe
 
-| Resolution | Bitrate | Max FPS | YOLOv8 Inference | GPU Benefit |
-|:---|:---|:---:|:---:|:---|
-| **QVGA (320×240)** | 1.5 Mbps | 45 | 150 ms | 3× faster |
-| **HQVGA (240×320)** | 2.4 Mbps | 40 | 85 ms | 4× faster |
-| **QVGA (320×240)** | 2.4 Mbps | 40 | 70 ms | 5× faster |
-| **VGA (640×480)** | 7.2 Mbps | 20 | 45 ms | 6× faster |
-| **SVGA (800×600)** | 11.5 Mbps | 15 | 180 ms | 4× faster |
+# PowerShell: Remove pycache
+Get-ChildItem -Path . -Filter "__pycache__" -Recurse -Directory | Remove-Item -Force -Recurse
 
-*ESP32S3 performs ~2× faster than ESP32 due to superior PSRAM*
+# Clear Ultralytics cache
+rm "$env:APPDATA\Ultralytics"  # PowerShell
+```
 
-### GPU Acceleration Gains (YOLOv8m @ 640×640)
+### Check Port Usage
+```bash
+netstat -ano | findstr :5000
+netstat -ano | findstr :8765
+taskkill /PID <PID> /F
+```
 
-| Device | Time | Throughput |
-|:---|:---:|:---:|
-| CPU (i7-10700K) | 125 ms | 8 FPS |
-| RTX 2060 | 18 ms | 55 FPS |
-| RTX 3080 | 8 ms | 125 FPS |
-
----
-
-## 🧪 Testing & Simulation
-
-### Test PID Controller Tuning
+## 🧪 Testing
 
 ```bash
+# PID Controller Tuning
 python tests/pid_simulator.py
-```
 
-Features:
-- Dark-themed GUI with real-time visualization
-- Adjustable Kp, Ki, Kd gains
-- Live convergence plotting
-- Useful for tuning motor control parameters
-
-### Test Sensor Fusion (Gyro + Accelerometer)
-
-```bash
+# Sensor Fusion Simulator
 python tests/gyro_acc.py
-```
 
-Features:
-- Complementary filter simulation
-- Real-time angle tracking
-- Noise injection for realistic testing
-
-### Property Validation
-
-```bash
+# Property Validation
 python tests/prop_check.py
-```
-
-Validates:
-- Video capture formats
-- Network connectivity
-- Model loading
-- Serial communication
-
----
-
-## 🔌 Hardware Integration
-
-### Supported Sensors & Peripherals
-
-**Camera Sensors:**
-- OV2640 (2MP) - Standard
-- OV3660 (3MP) - Better quality
-- OV5640 (5MP) - High resolution with autofocus
-- PY260 (2MP)
-
-**Motion Detection:**
-- PIR Sensor (passive infrared)
-- MPU6050 Accelerometer (on-board detection)
-- MPU9250 9-DOF IMU
-- Radar sensor
-
-**Audio:**
-- I2S Microphone (recommended)
-- PDM Microphone
-
-**Actuators:**
-- SG90 Servo motors (pan/tilt)
-- MX1508 H-bridge (motor control)
-- 28BYJ-48 Stepper motor
-- WS2812 / SK6812 RGB LEDs
-
-**I2C Devices:**
-- BMP280 / BME280 (barometer/humidity)
-- SSD1306 (OLED display)
-- LCD1602 (character display)
-
----
-
-## 📡 Connectivity Options
-
-| Protocol | Purpose | Status |
-|:---|:---|:---:|
-| **WiFi** | Primary streaming | ✅ Active |
-| **RTSP** | Media player | ✅ Concurrent |
-| **HTTP** | Web dashboard | ✅ Always on |
-| **MQTT** | Home Assistant | ✅ Optional |
-| **WebSocket** | Python analysis | ✅ Real-time |
-| **FTP** | File transfer | ✅ On demand |
-| **WebDAV** | Network drive | ✅ Optional |
-| **Telegram** | Alerts | ✅ Optional |
-
----
-
-## 📚 Usage Examples
-
-### Basic Object Detection Loop
-
-```python
-from analysing import model, cfg, get_drone_ip
-import cv2
-
-# Get drone IP (confirms connection)
-drone_ip = get_drone_ip(com_port="COM5", timeout_sec=10)
-print(f"Drone online at: {drone_ip}")
-
-# Open video stream
-cap = cv2.VideoCapture("http://127.0.0.1:5000/")
-
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-    
-    # Run YOLOv8
-    results = model.predict(frame, conf=cfg["conf"], device=cfg["device"])
-    
-    # Process detections
-    for box in results[0].boxes:
-        x1, y1, x2, y2 = box.xyxy[0]
-        confidence = box.conf[0]
-        cls = box.cls[0]
-        print(f"Class: {cls}, Confidence: {confidence:.2f}")
-    
-    # Display
-    annotated_frame = results[0].plot()
-    cv2.imshow("YOLOv8 Detection", annotated_frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-cap.release()
-cv2.destroyAllWindows()
-```
-
-### Stream Video to Web Browser
-
-```python
-# Terminal 1: Start WebSocket receiver
-python esp32cam-stream/stream/receive_stream.py
-
-# Terminal 2: Connect ESP32-CAM
-# (See Setup section)
-
-# Terminal 3: View in browser (or use HTML client)
-# The frame display is shown by receive_stream.py
 ```
 
 ---
 
 ## 🐛 Troubleshooting
 
-### ESP32-CAM Won't Flash
+**ESP32-CAM Won't Flash:**
+- Ensure IO0 connected to GND during flashing
+- Try different USB cable (data, not charge-only)
+- Update CH340 driver if using clones
 
-**Problem:** `Failed to connect`
-- **Solution:** 
-  - Ensure IO0 is connected to GND during flashing
-  - Try different USB cable (data cable, not charge-only)
-  - Use Arduino IDE Serial Monitor to verify connection: 115200 baud
-  - Reset board with power cycle: unplug USB, wait 2 seconds, reconnect
-  - Update CH340 driver if using clones
+**No Video Stream:**
+- Verify WiFi connection: `http://<esp32-ip>`
+- PC and ESP32-CAM on same network (not VPN)
+- Check firewall: allow port 8765 & 8000
 
-### No Video Stream
+**YOLOv8 Slow:**
+- Reduce image size: `imgsz=320`
+- Use smaller model: `yolov8s.pt`
+- Check GPU active: `nvidia-smi`
 
-**Problem:** `Connection refused` or `Frame loss`
-- **Solution:**
-  - Verify WiFi connection: check ESP32-CAM dashboard at `http://<esp32-ip>`
-  - Ensure PC and ESP32-CAM are on same network (not VPN/guest network)
-  - Check firewall: allow port 8765 (WebSocket) and 8000 (HTTP)
-  - Reduce resolution if bandwidth limited: use QVGA instead of SVGA
-  - Restart both WebSocket server and ESP32-CAM
-  - Check router WiFi interference: switch to 2.4GHz only (ESP32-CAM limitation)
+**GPU Not Detected:**
+- Update GPU drivers (NVIDIA/AMD/Intel)
+- Check CUDA: `python -c "import torch; print(torch.cuda.is_available())"`
+- Restart Python after driver update
 
-### YOLOv8 Slow / High Latency
-
-**Problem:** Detection taking >500ms per frame
-- **Solution:**
-  - Increase frame skip: `skip=3` or `skip=4` in `analysing.py`
-  - Reduce image size: use `imgsz=320` for faster inference
-  - Use smaller model: switch to `yolov8s.pt` or `yolov8n.pt`
-  - Verify GPU is being used: check console output for device type
-  - Close other GPU-intensive applications (Chrome, games, etc.)
-  - Check GPU temperature: may be thermal throttling if >80°C
-
-### Serial Port Issues
-
-**Problem:** `Failed to open serial port COM5`
-- **Solution:**
-  - Verify correct COM port: check Device Manager
-  - Ensure no other application has port open (Arduino IDE, PuTTY)
-  - Try different baud rates (default: 115200)
-  - Check USB driver installation: CH340 or FTDI driver
-  - Uninstall and reinstall USB drivers if corrupted
-
-### GPU Not Detected
-
-**Problem:** Using CPU instead of GPU, output shows `device: cpu`
-- **Solution:**
-  - Verify GPU drivers are installed: NVIDIA/AMD/Intel drivers up-to-date
-  - Check CUDA installation: `python -c "import torch; print(torch.cuda.is_available())"`
-  - For NVIDIA: ensure CUDA 11.8+ and cuDNN installed
-  - Restart Python environment after driver installation
-  - Check available VRAM: `nvidia-smi` command (NVIDIA)
-  - Try explicit device: modify `analysing.py` with `device='cuda'`
-
-### Out of Memory Error
-
-**Problem:** `RuntimeError: CUDA out of memory` or `MemoryError`
-- **Solution:**
-  - Reduce batch size in `analysing.py`: `batch=1`
-  - Switch to smaller model: `yolov8n.pt` (nano) or `yolov8s.pt` (small)
-  - Lower image resolution: use `imgsz=320` instead of 640
-  - Clear GPU cache: restart Python script between runs
-  - Check VRAM usage: `nvidia-smi` (NVIDIA) or Task Manager (AMD)
-  - For CPU: increase system RAM available or close background applications
-
-### Model Loading Error
-
-**Problem:** `ModuleNotFoundError` or `FileNotFoundError: yolov8n.pt`
-- **Solution:**
-  - Ensure `yolov8n.pt` exists in project root: `f:\drone\yolov8n.pt`
-  - Verify model downloaded correctly: file size should be >40MB
-  - Check file permissions: read access required
-  - Re-download if corrupted: `python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"`
-  - Verify YOLO installation: `pip install ultralytics==8.0.0` or later
-
-### WiFi Keeps Disconnecting
-
-**Problem:** `Connection lost` or `Reconnecting...`
-- **Solution:**
-  - Check WiFi signal strength: move ESP32-CAM closer to router
-  - Reduce transmit power loss: use 2.4GHz band (5GHz has poor range)
-  - Disable WiFi power saving on router if available
-  - Increase WiFi timeout in firmware: edit `globals.h` → `WIFI_TIMEOUT`
-  - Check for interference: microwaves, Bluetooth, cordless phones
-  - Use static IP instead of DHCP for stability
-  - Monitor logs for "brownout detector triggered" (power supply issue)
-
-### Camera Not Initializing
-
-**Problem:** Black screen or `Camera init failed`
-- **Solution:**
-  - Verify correct camera model selected in `appGlobals.h`
-  - Check I2C connection: SDA/SCL pins properly wired
-  - Inspect camera module for physical damage or dust
-  - Ensure camera ribbon cable fully inserted and aligned
-  - Try different camera model definition as fallback
-  - Reset camera with power cycle: full system restart
-  - Check power supply: ESP32-CAM needs 3.3V @ 160mA stable
-
-### SD Card Issues
-
-**Problem:** `No SD card detected` or `Write failed`
-- **Solution:**
-  - Use Class 10 microSD card for reliable performance
-  - Format SD card as FAT32 in Windows Explorer
-  - Check SD card inserted fully and making contact
-  - Test card in another device to verify functionality
-  - Enable SD card in firmware: check `globals.h` SD_MMC settings
-  - Monitor free space: delete old videos if drive full
-  - Use USB adapter for reliable reading on PC
-
-### MQTT Connection Failed
-
-**Problem:** `MQTT connection refused` or `Timeout`
-- **Solution:**
-  - Verify MQTT broker is running and accessible: `mqtt-8883` or `1883` port
-  - Check firewall rules: allow MQTT port (usually 1883)
-  - Verify credentials: username/password in firmware correct
-  - Check MQTT broker logs for authentication errors
-  - Use public broker for testing: `mqtt.eclipse.org` (port 1883)
-  - Ensure PC and ESP32-CAM can communicate: ping test first
-
-### Telegram Alerts Not Received
-
-**Problem:** No notifications in Telegram or `Bot init failed`
-- **Solution:**
-  - Verify Bot Token correct: obtain from BotFather on Telegram
-  - Check Chat ID correct: send `/start` to bot to get chat ID
-  - Ensure motion detection is enabled: PIR sensor or frame diff
-  - Check internet connection on ESP32-CAM: verify WiFi connected
-  - Monitor Telegram bot logs for error messages
-  - Test with simple text message first, then image attachment
-  - Rate limit: Telegram may block rapid messages (>30/min)
-
-### Frame Rate Lower Than Expected
-
-**Problem:** Getting 5-10 FPS instead of 15-30 FPS
-- **Solution:**
-  - Check WiFi signal quality: RSSI value in ESP32-CAM logs
-  - Reduce frame resolution: SVGA(800x600) slower than QVGA(320x240)
-  - Lower JPEG quality in firmware: `#define JPEG_QUALITY 8` (lower = faster)
-  - Check CPU load: other processes consuming resources
-  - Monitor WiFi bandwidth: use network analyzer
-  - For OV2640: maximum theoretical FPS is 15 at SVGA
-  - Consider upgrading to OV3660/OV5640 for higher frame rates
+**Out of Memory:**
+- Use smaller model: `yolov8n.pt`
+- Reduce resolution: `imgsz=320`
+- Restart Python between runs
 
 ---
 

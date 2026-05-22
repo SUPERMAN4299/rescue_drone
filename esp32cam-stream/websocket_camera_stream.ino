@@ -20,13 +20,14 @@
 
 #include "esp_camera.h"
 #include <WiFi.h>
+#include "wifi_config.h"
 #include <ArduinoWebsockets.h>
 
 using namespace websockets;
 
 // ── WiFi Config ───────────────────────────────────────────────────────────────
-const char* WIFI_SSID     = "YOUR_WIFI_NAME";      // ← change this
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";  // ← change this
+const char* WIFI_SSID     = WIFI_SSID;      // ← change this
+const char* WIFI_PASSWORD = WIFI_PASSWORD;  // ← change this
 
 // ── PC WebSocket Server ───────────────────────────────────────────────────────
 // This is your PC's LOCAL IP address (not 127.0.0.1)
