@@ -40,11 +40,6 @@
 
 ### Running the Stream
 
-1. **First terminal:** Run `python receive_stream.py` (displays image size)
-2. **Second terminal:** Run`python send_image_stream.py` (sends images to ESP32)
-
-### Troubleshooting 
-
-If the frame is breaking means their is a problem in backend in python so use `cp image.jpg placeholder.jpg` for windows `Copy-Item image.jpg placeholder.jpg`.
-
-In `websocket_camera_stream.ino` you can change the resolution on line 72.
+1. **First flash the .ino code in the esp32 cam**
+2. **First terminal:** Run `python receive_stream.py` (displays image size)
+3. **Second terminal:** Run`python send_image_stream.py` (sends images to ESP32)

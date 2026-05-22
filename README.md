@@ -88,7 +88,8 @@ drone/
 │   └── prop_check.py             # Property validation tests
 │
 └── README.md                      # This file
-├── analysing_cap.py               # analysing captures
+├── analysing_cap.py               # analysing captures and human detection
+└── test_cam.py                   # For testing detection (without ESP)
 ├── LISENCE                        # MIT lisence
 ```
 
