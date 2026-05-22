@@ -1,89 +1,77 @@
+"""
+receive_stream.py  ──  WebSocket frame receiver
+"""
+
 import asyncio
 import os
+import threading
+import time
 import websockets
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "image.jpg")
-TMP_PATH   = "image.jpg.tmp"
+
+# ── In-memory frame slot ──────────────────────────────────────────────────────
+_frame_lock  = threading.Lock()
+LATEST_FRAME = b""
+_frame_ts    = 0.0
 
 
-# ── JPEG validity check ───────────────────────────────────────────────────────
+def get_latest_frame() -> bytes:
+    with _frame_lock:
+        return LATEST_FRAME
+
+
+def _store_frame(data: bytes) -> None:
+    global LATEST_FRAME, _frame_ts
+    with _frame_lock:
+        LATEST_FRAME = data
+        _frame_ts    = time.time()
+    try:
+        with open(IMAGE_PATH, "wb", buffering=0) as f:
+            f.write(data)
+    except OSError:
+        pass
+
+
 def _is_jpeg(data: bytes) -> bool:
-    """
-    Check JPEG SOI (FF D8) and EOI (FF D9) markers.
-    Fast — no decode; avoids importing cv2/numpy entirely.
-    """
     return (len(data) >= 4
             and data[:2]  == b'\xff\xd8'
             and data[-2:] == b'\xff\xd9')
 
 
-# ── Frame handler ─────────────────────────────────────────────────────────────
 async def handle_connection(websocket):
-    """
-    Receives binary JPEG frames from the ESP32 over WebSocket and writes
-    them atomically to image.jpg for Flask to serve.
-
-    Key fixes vs original:
-      - Removed latest_frame (assigned but never read anywhere).
-      - Removed cv2 / numpy / BytesIO imports (nothing needs them here).
-      - Eliminated decode→re-encode round-trip: ESP32 already sends valid
-        JPEG; writing raw bytes preserves quality and removes CPU overhead.
-      - Validity is checked via JPEG SOI/EOI markers instead of a full decode.
-      - os.fsync() ensures bytes are flushed to disk before os.replace(),
-        preventing a corrupt image.jpg on crash or power loss.
-      - Per-frame bare except kept so one bad frame never kills the handler.
-    """
-    print("[WS] ESP32 Connected")
-
-    while True:
-        try:
-            message = await websocket.recv()
-
-            print(f"[WS] Frame received: {len(message)} bytes")
-
-            # Skip obviously too-small payloads (noise / handshake messages)
-            if len(message) < 1000:
+    peer = websocket.remote_address
+    print(f"[WS] Client connected: {peer}")
+    frame_count = 0
+    try:
+        async for message in websocket:
+            if len(message) < 100:   # lowered from 1000 — 320×240 Q60 can be small
                 continue
-
-            # Validate JPEG markers — skip silently if malformed
             if not _is_jpeg(message):
-                print("[WS] Skipping invalid JPEG frame (bad SOI/EOI markers)")
+                print(f"[WS] Invalid JPEG ({len(message)} bytes)")
                 continue
-
-            # ── Atomic write to disk ──────────────────────────────────────────
-            # Write raw ESP32 JPEG bytes directly — no decode/re-encode.
-            # os.replace() is atomic on POSIX and near-atomic on Windows
-            # (same-filesystem rename), so Flask never sees a partial file.
-            # Direct write (stable on Windows)
-            try:
-                with open(IMAGE_PATH, 'wb') as f:
-                    f.write(message)
-            
-            except Exception as e:
-                print(f"[WS] Save error: {e}")
-                continue
-
-        except websockets.exceptions.ConnectionClosed:
-            print("[WS] Disconnected")
-            break
-
-        except Exception as e:
-            # Catch all per-frame errors; log and continue so one bad frame
-            # (OS write error, etc.) does NOT kill the entire connection.
-            print(f"[WS] Frame handling error: {e}")
-            continue
+            _store_frame(message)
+            frame_count += 1
+            if frame_count % 100 == 0:
+                print(f"[WS] {frame_count} frames received")
+    except websockets.exceptions.ConnectionClosed:
+        print(f"[WS] Client disconnected: {peer}  ({frame_count} frames received)")
+    except Exception as e:
+        print(f"[WS] Error: {e}")
 
 
-# ── Server entry point ────────────────────────────────────────────────────────
 async def main():
-    async def wrapper(websocket):
-        await handle_connection(websocket)
-
-    server = await websockets.serve(wrapper, "0.0.0.0", 3001)
+    server = await websockets.serve(
+        handle_connection,
+        "0.0.0.0", 3001,
+        max_size      = 5 * 1024 * 1024,
+        ping_interval = None,   # ← DISABLE ping — matches client setting
+        compression   = None,
+    )
     print("[WS] Server running on port 3001")
     await server.wait_closed()
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
