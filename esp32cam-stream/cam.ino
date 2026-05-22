@@ -54,6 +54,7 @@ const char* WS_PATH = "/";
 #define VSYNC_GPIO_NUM    25
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
+#define FLASH_GPIO_NUM     4
 
 WebsocketsClient wsClient;
 bool wsConnected = false;
@@ -165,6 +166,7 @@ void connectWebSocket() {
 void setup() {
   Serial.begin(115200);
   Serial.println("\n[Boot] ESP32-CAM WebSocket Streamer");
+  pinMode(FLASH_GPIO_NUM, OUTPUT);
 
   if (!initCamera()) {
     Serial.println("[Boot] Camera failed — halting");
@@ -182,7 +184,8 @@ const int     FRAME_DELAY  = 66;   // ms between frames = ~15 fps
                                    // lower = faster but may overwhelm WiFi
 
 void loop() {
-  // Handle incoming WS messages / pings
+
+  digitalWrite(FLASH_GPIO_NUM, HIGH);  // turn on flash LED   // Handle incoming WS messages / pings
   if (wsConnected) {
     wsClient.poll();
   }
