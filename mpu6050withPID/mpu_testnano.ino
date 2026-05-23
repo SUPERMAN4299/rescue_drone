@@ -20,8 +20,15 @@ Adafruit_MPU6050 mpu;
 float gyroBiasX = 0.0;
 
 // -- PID gains ----------------------------------
-float kp = 0.5;
+// tuning 
+
+//Kp = increase - if response delay, barely changes speed (1)
+//Kp = decrease - if overshoot, oscillation, or instability (1)
+float kp = 0.5;  
+//Ki = decrease - if delayed wobble and slow oscillation (3)
 float ki = 0.02;
+//Kd = decrease - if twitchy response, noisy response, unstable PWM (2)
+//kd = increase - if slow drift, imblance (2)
 float kd = 8.0;
 
 // -- PID state ----------------------------------
