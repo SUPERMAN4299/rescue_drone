@@ -11,10 +11,16 @@
 //
 // Serial commands (115200 baud, newline-terminated):
 //   ARM, DISARM, STATUS, RECAL, RESETSTATS
-//   THROTTLE <n>  0–200
-//   ROLL <f>      ±30°
-//   PITCH <f>     ±30°
-//   YAW <f>       ±30°/s
+//   THROTTLE <n>  0–200          (long form)
+//   ROLL <f>      ±30°           (long form)
+//   PITCH <f>     ±30°           (long form)
+//   YAW <f>       ±30°/s         (long form)
+//
+// Short-form aliases (sent by the web controller HTML page):
+//   T:<n>   throttle 0–200
+//   R:<f>   roll     ±30°
+//   P:<f>   pitch    ±30°
+//   Y:<f>   yaw      ±30°/s
 
 #include <Wire.h>
 #include <math.h>
@@ -522,6 +528,38 @@ static void processCmd(const char* raw) {
 
   if (strncmp_P(c, PSTR("YAW "), 4) == 0) {
     float v = constrain((float)atof(c + 4), -MAX_SP, MAX_SP);
+    sp_yaw = v;
+    Serial.print(F("YAW=")); Serial.println(v, 2);
+    return;
+  }
+
+  // ── SHORT-FORM ALIASES (sent by the web controller) ──────────────
+  // HTML controller sends: T:<n>  R:<f>  P:<f>  Y:<f>
+  // These are mapped to the same setpoints as the long-form commands.
+
+  if (c[0] == 'T' && c[1] == ':') {
+    int v = constrain(atoi(c + 2), MIN_THR, MAX_THR);
+    sp_thr = v;
+    Serial.print(F("THROTTLE=")); Serial.println(v);
+    return;
+  }
+
+  if (c[0] == 'R' && c[1] == ':') {
+    float v = constrain((float)atof(c + 2), -MAX_SP, MAX_SP);
+    sp_roll = v;
+    Serial.print(F("ROLL=")); Serial.println(v, 2);
+    return;
+  }
+
+  if (c[0] == 'P' && c[1] == ':') {
+    float v = constrain((float)atof(c + 2), -MAX_SP, MAX_SP);
+    sp_pitch = v;
+    Serial.print(F("PITCH=")); Serial.println(v, 2);
+    return;
+  }
+
+  if (c[0] == 'Y' && c[1] == ':') {
+    float v = constrain((float)atof(c + 2), -MAX_SP, MAX_SP);
     sp_yaw = v;
     Serial.print(F("YAW=")); Serial.println(v, 2);
     return;
