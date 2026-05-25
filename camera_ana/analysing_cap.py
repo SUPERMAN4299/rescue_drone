@@ -131,7 +131,7 @@ _PRIVATE_IP_RE = re.compile(
 )
 
 
-def get_drone_ip(com_port="COM5", baud_rate=115200,
+def get_drone_ip(com_port="COM5", baud_rate=115200,    # Select your com port
                  timeout_sec=30, max_attempts=None):
     try:
         import serial
@@ -210,6 +210,10 @@ print(f"[Config] Img size: {cfg['imgsz']}")
 print(f"[Config] FP16    : {cfg['half']}")
 print(f"[Config] Res     : {cfg['cam_w']}×{cfg['cam_h']}\n")
 
+# Slight upscale for the displayed output (1.0 = native, >1.0 = larger)
+# Tune this to 'increase the output frame little bit'
+cfg['display_scale'] = 1.2
+print(f"[Config] Display scale: {cfg['display_scale']:.2f}x\n")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  LOAD MODEL
@@ -420,6 +424,20 @@ def draw_boxes(frame: np.ndarray, boxes: list) -> None:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1)
 
 
+def _scale_frame_for_display(frame: np.ndarray) -> np.ndarray:
+    """Resize frame for display according to `cfg['display_scale']`.
+
+    Returns the original frame if scale == 1.0.
+    """
+    scale = float(cfg.get('display_scale', 1.0))
+    if scale == 1.0:
+        return frame
+    h, w = frame.shape[:2]
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -475,7 +493,7 @@ def main():
             if frame is None:
                 # Nothing yet — keep window alive
                 if last_display_frame is not None:
-                    cv2.imshow("Human Detection", last_display_frame)
+                    cv2.imshow("Human Detection", _scale_frame_for_display(last_display_frame))
                 if cv2.waitKey(10) & 0xFF == ord('q'):
                     break
                 continue
@@ -483,6 +501,12 @@ def main():
             # Draw on a copy so the YOLO thread always has the clean original
             display_frame = frame.copy()
             boxes         = _get_latest_boxes()
+
+            # ── Human count file (real-time, current visible humans only) ─
+            human_count = len(boxes)
+            with open("human_count.txt", "w") as file:
+                file.write(str(human_count))
+
             draw_boxes(display_frame, boxes)
 
             # ── HUD ───────────────────────────────────────────────────────────
@@ -508,7 +532,7 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30,  30,  30),  1)
                 y += 26
 
-            cv2.imshow("Human Detection", display_frame)
+            cv2.imshow("Human Detection", _scale_frame_for_display(display_frame))
             last_display_frame = display_frame
 
             if cv2.waitKey(1) & 0xFF == ord('q'):

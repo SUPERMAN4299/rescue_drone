@@ -1,5 +1,5 @@
 """
-test_cam.py  ──  Mobile Camera → WebSocket simulator
+test_cam.py  ──  Mobile Camera → WebSocket simulat
 """
 
 import asyncio
@@ -12,7 +12,7 @@ WS_URI = "ws://127.0.0.1:3001"
 
 # Mobile IP Webcam URL
 
-MOBILE_CAM_URL = "http://192.168.1.2:8080/video"
+DRONE_CAM_IP = "http://192.168.1.2:8080/video"
 CAM_WIDTH    = 320
 CAM_HEIGHT   = 240
 TARGET_FPS   = 15
@@ -35,7 +35,7 @@ async def send_frames():
         print("[Cam] Connected")
 
         # ── USE MOBILE CAMERA STREAM ─────────────────────────────
-        cap = cv2.VideoCapture(MOBILE_CAM_URL)
+        cap = cv2.VideoCapture(DRONE_CAM_IP)
 
         if not cap.isOpened():
             print("[Cam] ERROR: Cannot open mobile camera stream")

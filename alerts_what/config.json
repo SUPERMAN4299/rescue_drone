@@ -1,0 +1,6 @@
+{
+    "account_sid": "YOUR_TWILIO_SID",
+    "auth_token": "YOUR_TWILIO_TOKEN",
+    "FROM_WHATSAPP": "+1567XXXXX48",
+    "TO_WHATSAPP": "+9XXXXXXXXX"
+}

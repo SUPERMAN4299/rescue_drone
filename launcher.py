@@ -33,7 +33,7 @@ def p(*parts):
 SCRIPTS = {
     "receive_stream"    : p("esp32cam-stream", "stream", "receive_stream.py"),
     "send_image_stream" : p("esp32cam-stream", "stream", "send_image_stream.py"),
-    "analysing_cap"     : p("analysing_cap.py"),
+    "analysing_cap"     : p("camera_ana", "analysing_cap.py"),
     "test_cam"          : p("test_cam.py"),
 }
 
