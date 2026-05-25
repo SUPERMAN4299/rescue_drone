@@ -237,7 +237,7 @@ HUMAN_CLASS = 0
 # immediately — the YOLO thread always gets the freshest image.
 
 STREAM_PORT = 5000
-stream_url  = f"http://127.0.0.1:{STREAM_PORT}/"
+stream_url = f"http://127.0.0.1:{STREAM_PORT}/"
 
 # Thread-shared state
 _frame_lock    = threading.Lock()
@@ -426,7 +426,7 @@ def draw_boxes(frame: np.ndarray, boxes: list) -> None:
 
 def main():
     # ── Drone serial confirmation ────────────────────────────────────────────
-    router_ip = "127.0.0.1"          # ← TEST MODE; replace with get_drone_ip()
+    router_ip = "http://192.168.1.2:8080"          # ← TEST MODE; replace with get_drone_ip()
     print(f"[Serial] Drone IP: {router_ip}  (test mode)")
 
     # ── Start background threads ─────────────────────────────────────────────
