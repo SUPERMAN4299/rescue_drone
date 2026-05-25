@@ -2,7 +2,7 @@
 """
 Drone Serial-HTTP Bridge
 Forwards HTTP POST /cmd  →  Arduino Nano serial port
-Serves drone_controller.html on GET /
+Serves index.html on GET /
 
 Usage:
   pip install pyserial
@@ -45,13 +45,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            html = open("drone_controller.html", "rb").read()
+            html = open("index.html", "rb").read()
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
             self.wfile.write(html)
         except FileNotFoundError:
-            self.send_error(404, "drone_controller.html not found — put it next to bridge.py")
+            self.send_error(404, "index.html not found — put it next to bridge.py")
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
