@@ -1,5 +1,5 @@
 """
-launcher.py  ──  Run the entire drone AI pipeline in one command
+main.py  ──  Run the entire drone AI pipeline in one command
 ════════════════════════════════════════════════════════════════
 Starts all 3 scripts simultaneously in separate processes:
   1. receive_stream.py   — WebSocket server (port 3001)
@@ -7,10 +7,10 @@ Starts all 3 scripts simultaneously in separate processes:
   3. analysing_cap.py    — YOLO human detector
 
 Usage:
-  python launcher.py
+  python main.py
 
   # With webcam simulator instead of ESP32:
-  python launcher.py --test
+  python main.py --test
 
 # TO USE ALERTS USE JUST REMOVE COMMENTS
 
@@ -29,7 +29,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PYTHON   = sys.executable   # use the same python/venv that runs this script
 
 def p(*parts):
-    """Build an absolute path relative to launcher.py location."""
+    """Build an absolute path relative to main.py location."""
     return os.path.join(BASE_DIR, *parts)
 
 SCRIPTS = {
@@ -37,7 +37,7 @@ SCRIPTS = {
     "send_image_stream" : p("esp32cam-stream", "stream", "send_image_stream.py"),
     "analysing_cap"     : p("camera_ana", "analysing_cap.py"),
     "test_cam"          : p("test_cam.py"),
-    "alert"             : p("alerts_what", "alert.py")
+    #"alert"             : p("alerts_what", "alert.py")
 }
 
 # How long to wait between starting each script (seconds)
@@ -48,7 +48,7 @@ STARTUP_DELAYS = {
     "send_image_stream" : 1,   # wait 1s after receive_stream
     "analysing_cap"     : 3,   # wait 3s for Flask to be ready
     "test_cam"          : 2,   # wait 2s after receive_stream
-    "alert"             : 10,  # wait 10s after test_cam
+    #"alert"             : 10,  # wait 10s after test_cam
 }
 
 # ANSI colors for each process log prefix
@@ -57,7 +57,7 @@ COLORS = {
     "send_image_stream" : "\033[33m",   # yellow
     "analysing_cap"     : "\033[32m",   # green
     "test_cam"          : "\033[35m",   # magenta
-    "alert"             : "\033[31m",
+    #"alert"             : "\033[31m",
 }
 RESET = "\033[0m"
 

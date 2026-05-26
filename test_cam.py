@@ -12,7 +12,7 @@ WS_URI = "ws://127.0.0.1:3001"
 
 # Mobile IP Webcam URL
 
-DRONE_CAM_IP = "http://192.168.1.2:8080/video"
+DRONE_CAM_IP = "http://192.168.1.6:8080/video" # change ip
 CAM_WIDTH    = 320
 CAM_HEIGHT   = 240
 TARGET_FPS   = 15
