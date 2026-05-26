@@ -583,11 +583,15 @@ def _next_search_state(obstacles: list[ObstacleInfo]) -> str:
 
         # Cap the forward creep at FORWARD_SCAN_DURATION
         if (now - _forward_scan_start) >= FORWARD_SCAN_DURATION:
-            # Micro-creep elapsed — force phase advance to avoid getting stuck
+            # PATCH 5 — Micro-creep elapsed.  Advance FSM phase naturally
+            # instead of hardcoding NAV_SEARCH_LEFT, which caused a leftward
+            # bias and broke cycle symmetry.  The next phase in _SEARCH_CYCLE
+            # is whatever follows FORWARD_SCAN (i.e. back to SEARCH_LEFT via
+            # modulo wrap), so the cycle remains symmetric.
             _search_phase_index = (_search_phase_index + 1) % len(_SEARCH_CYCLE)
             _search_phase_start = now
             _forward_scan_start = 0.0
-            return NAV_SEARCH_LEFT   # resume sideways search immediately
+            return _SEARCH_CYCLE[_search_phase_index]   # follow cycle, no bias
 
         return NAV_FORWARD_SCAN
 
@@ -617,7 +621,12 @@ def _next_search_state(obstacles: list[ObstacleInfo]) -> str:
 _oscillation_timestamps: deque = deque()   # timestamps of dangerous command changes
 _emergency_active: bool = False
 _emergency_start:  float = 0.0
-EMERGENCY_HOLD_DURATION: float = 1.5       # hold EMERGENCY_STOP for N seconds
+# PATCH 3 — Extended from 1.5 s to 2.5 s.
+# 1.5 s was too short for WiFi jitter / temporary stream freezes; the
+# emergency could release before the hazard fully cleared.  2.5 s gives
+# enough headroom for a real-world network hiccup while not freezing the
+# drone indefinitely if the scene recovers quickly.
+EMERGENCY_HOLD_DURATION: float = 2.5       # hold EMERGENCY_STOP for N seconds
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  FIX 2 — STALE FRAME THRESHOLD
@@ -844,6 +853,32 @@ _nav_state        = NAV_SEARCH
 _nav_prev_raw     = NAV_SEARCH
 _nav_stable_count = 0
 _nav_final_cmd    = NAV_SEARCH
+
+
+def _force_emergency_nav_state() -> None:
+    """
+    PATCH 1 — Force the navigation FSM into EMERGENCY_STOP synchronously.
+
+    Called from the stale-frame path and the reader-failure path in main().
+    Without this, send_nav_token() would transmit "ES" to the Arduino while
+    nav_cmd / _nav_final_cmd still held a stale value (e.g. "FORWARD").
+    That desynchronisation caused:
+      • The HUD to display the wrong command
+      • draw_nav_overlay() to render the wrong arrow / banner
+      • Any code reading _nav_final_cmd to see an unsafe stale state
+
+    This function must be called BEFORE the frame is rendered so that both
+    the overlay and the HUD display NAV_EMERGENCY_STOP consistently.
+    It is intentionally lightweight (no lock needed — called from the single
+    display loop thread) and does not touch the YOLO or reader threads.
+    """
+    global _nav_state, _nav_prev_raw, _nav_stable_count, _nav_final_cmd
+    _nav_final_cmd    = NAV_EMERGENCY_STOP
+    _nav_state        = NAV_EMERGENCY_STOP
+    _nav_prev_raw     = NAV_EMERGENCY_STOP
+    # Reset stability counter so the first non-emergency command must re-earn
+    # its stability window before overriding the emergency state.
+    _nav_stable_count = 0
 
 
 def nav_decision(boxes: list,
@@ -1074,15 +1109,27 @@ class ArduinoSerial:
         Send 'HB\\n' periodically so the Arduino watchdog knows Python is alive.
         The Arduino sketch should implement: if no HB received within 2×interval,
         stop all motors (fail-safe).
+
+        PATCH 2 — Route through self.send(..., force=True) instead of
+        self._write() directly.  This ensures:
+          • the per-command cooldown (COMMAND_SEND_INTERVAL) is respected, so
+            a burst of nav commands + heartbeat cannot overflow the serial
+            buffer on slow devices;
+          • duplicate-suppression is bypassed (force=True) so the heartbeat
+            is always transmitted even if "HB" was the last sent token;
+          • _last_send_t is updated, preventing a nav command from
+            immediately following the heartbeat within the cooldown window.
+        The lock inside send() serialises access with concurrent nav writes,
+        eliminating the race condition present when _write() was called directly.
         """
         while not self._hb_stop.is_set():
             time.sleep(HEARTBEAT_INTERVAL)
             if self._hb_stop.is_set():
                 break
             try:
-                self._write("HB")
+                self.send("HB", force=True)   # PATCH 2: use send(), not _write()
             except Exception:
-                pass   # already handled inside _write
+                pass   # already handled inside send() → _write()
 
     def close(self) -> None:
         """Graceful shutdown — stop heartbeat and close port."""
@@ -1369,8 +1416,13 @@ def draw_nav_overlay(frame: np.ndarray,
 # Set to e.g. 0.08 for ~12 fps max on a weak CPU to free cycles for display.
 ADAPTIVE_MIN_INFERENCE_INTERVAL: float = 0.0   # seconds; 0 = disabled
 
-# Low-power mode: when True, YOLO runs at half-size and skips alternate frames.
-# Toggle via: set_low_power_mode(True)
+# Low-power mode: when True, YOLO runs at a reduced inference resolution and
+# skips alternate frames.  Toggle via: set_low_power_mode(True)
+# PATCH 6 — Comment corrected: the reduced size is 320 px (a fixed constant
+# chosen for a good YOLO speed/accuracy trade-off on weak CPUs), NOT simply
+# "half the configured imgsz".  For example, if cfg["imgsz"] == 416 the
+# reduction is 416→320, not 416→208.  The HUD (FIX 5) already shows the
+# ACTUAL runtime inference size to avoid confusion.
 _low_power_mode: bool = False
 _lp_frame_toggle: bool = False   # alternating skip flag
 
@@ -1380,8 +1432,10 @@ def set_low_power_mode(enabled: bool) -> None:
     Enable / disable low-power CPU mode.
 
     When enabled:
-      • Alternate frames are skipped in the YOLO thread (halves inference load)
-      • A note is printed to console
+      • Alternate frames are skipped in the YOLO thread (halves frame load)
+      • Inference resolution is reduced to 320 px (from cfg["imgsz"]),
+        roughly halving memory bandwidth and FLOPs on weak CPUs.
+        NOTE: the reduction is always to 320 px, not to half of cfg["imgsz"].
 
     Note: this sets module-level flags read by _yolo_should_skip().
     """
@@ -1738,18 +1792,23 @@ def _yolo_loop():
                         _track_hits.pop(tid, None)
                         _track_misses.pop(tid, None)
 
-            # FIX 7 — Hard-cap memory structure sizes to prevent unbounded
-            # growth under tracking instability (e.g. a jittery scene that
-            # generates thousands of short-lived track IDs).
-            # Clearing is cheaper than eviction and acceptable because EMA
-            # state for genuinely persistent tracks will rebuild in 2–3 frames.
+            # PATCH 4 — Replace full .clear() with bounded oldest-first eviction.
+            # Clearing ALL entries causes an instant perception collapse:
+            # every tracked object loses its EMA history and the nav stack
+            # can lurch between depth estimates for 2-3 frames.  Evicting
+            # the oldest 25 % of entries instead preserves recently-active
+            # track state while still capping memory growth.
             if len(_depth_ema) > 200:
-                _depth_ema.clear()
-                print("[YOLO] _depth_ema cleared (growth cap)")
+                evict_count = max(1, len(_depth_ema) // 4)   # evict ~25 %
+                for _tid in list(_depth_ema.keys())[:evict_count]:
+                    _depth_ema.pop(_tid, None)
+                print(f"[YOLO] _depth_ema evicted {evict_count} oldest entries")
             if len(_track_hits) > 300:
-                _track_hits.clear()
-                _track_misses.clear()
-                print("[YOLO] _track_hits/_misses cleared (growth cap)")
+                evict_count = max(1, len(_track_hits) // 4)
+                for _tid in list(_track_hits.keys())[:evict_count]:
+                    _track_hits.pop(_tid, None)
+                    _track_misses.pop(_tid, None)
+                print(f"[YOLO] _track_hits/_misses evicted {evict_count} oldest entries")
 
             with _boxes_lock:
                 _latest_boxes = new_boxes
@@ -1893,13 +1952,22 @@ def main():
                 if _reader_fail_start == 0.0:
                     _reader_fail_start = time.time()
                     print("[Main] Reader died — holding EMERGENCY_STOP")
+                    # PATCH 1: synchronise internal nav FSM state so HUD and
+                    # overlays show EMERGENCY_STOP, not a stale command.
+                    _force_emergency_nav_state()
                     send_nav_token(ARDUINO_TOKENS[NAV_EMERGENCY_STOP], force=True)
 
                 elapsed_fail = time.time() - _reader_fail_start
                 if elapsed_fail < READER_FAIL_HOLD:
+                    # PATCH 1: keep re-asserting emergency state each iteration
+                    # in case any background path attempted to overwrite it.
+                    _force_emergency_nav_state()
                     # Render ES overlay on last known frame if available
                     if last_display_frame is not None:
                         _render_reader_fail_overlay(last_display_frame, elapsed_fail)
+                        draw_nav_overlay(last_display_frame, NAV_EMERGENCY_STOP,
+                                         [], None, last_display_frame.shape[1],
+                                         last_display_frame.shape[0])
                         cv2.imshow("Human Detection",
                                    _scale_frame_for_display(last_display_frame))
                     if cv2.waitKey(50) & 0xFF == ord('q'):
@@ -1916,10 +1984,17 @@ def main():
             # (VideoCapture hanging, stream frozen, network stall).
             stale = (time.time() - _last_frame_timestamp) > STALE_FRAME_TIMEOUT
             if stale:
+                # PATCH 1: synchronise internal nav FSM state BEFORE rendering
+                # so HUD, overlays, and _nav_final_cmd all show EMERGENCY_STOP.
+                _force_emergency_nav_state()
                 # Force EMERGENCY_STOP — override nav stack output
                 send_nav_token(ARDUINO_TOKENS[NAV_EMERGENCY_STOP], force=True)
                 if last_display_frame is not None:
+                    # Re-render nav overlay on the stale frame with correct state
                     _render_stale_overlay(last_display_frame)
+                    draw_nav_overlay(last_display_frame, NAV_EMERGENCY_STOP,
+                                     [], None, last_display_frame.shape[1],
+                                     last_display_frame.shape[0])
                     cv2.imshow("Human Detection",
                                _scale_frame_for_display(last_display_frame))
                 if cv2.waitKey(10) & 0xFF == ord('q'):
