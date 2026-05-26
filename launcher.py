@@ -12,6 +12,8 @@ Usage:
   # With webcam simulator instead of ESP32:
   python launcher.py --test
 
+# TO USE ALERTS USE JUST REMOVE COMMENTS
+
 Press Ctrl+C to stop everything.
 """
 
@@ -35,6 +37,7 @@ SCRIPTS = {
     "send_image_stream" : p("esp32cam-stream", "stream", "send_image_stream.py"),
     "analysing_cap"     : p("camera_ana", "analysing_cap.py"),
     "test_cam"          : p("test_cam.py"),
+    "alert"             : p("alerts_what", "alert.py")
 }
 
 # How long to wait between starting each script (seconds)
@@ -45,6 +48,7 @@ STARTUP_DELAYS = {
     "send_image_stream" : 1,   # wait 1s after receive_stream
     "analysing_cap"     : 3,   # wait 3s for Flask to be ready
     "test_cam"          : 2,   # wait 2s after receive_stream
+    "alert"             : 10,  # wait 10s after test_cam
 }
 
 # ANSI colors for each process log prefix
@@ -53,6 +57,7 @@ COLORS = {
     "send_image_stream" : "\033[33m",   # yellow
     "analysing_cap"     : "\033[32m",   # green
     "test_cam"          : "\033[35m",   # magenta
+    "alert"             : "\033[31m",
 }
 RESET = "\033[0m"
 
