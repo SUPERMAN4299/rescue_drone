@@ -35,7 +35,7 @@ def p(*parts):
 SCRIPTS = {
     "receive_stream"    : p("esp32cam-stream", "stream", "receive_stream.py"),
     "send_image_stream" : p("esp32cam-stream", "stream", "send_image_stream.py"),
-    "analysing_cap"     : p("camera_ana", "analysing_cap.py"),
+    "testanalysing_cap"     : p("camera_ana", "testanalysing_cap.py"),
     "test_cam"          : p("test_cam.py"),
     #"alert"             : p("alerts_what", "alert.py")
 }
@@ -46,7 +46,7 @@ SCRIPTS = {
 STARTUP_DELAYS = {
     "receive_stream"    : 0,
     "send_image_stream" : 1,   # wait 1s after receive_stream
-    "analysing_cap"     : 3,   # wait 3s for Flask to be ready
+    "testanalysing_cap"     : 3,   # wait 3s for Flask to be ready
     "test_cam"          : 2,   # wait 2s after receive_stream
     #"alert"             : 10,  # wait 10s after test_cam
 }
@@ -55,7 +55,7 @@ STARTUP_DELAYS = {
 COLORS = {
     "receive_stream"    : "\033[36m",   # cyan
     "send_image_stream" : "\033[33m",   # yellow
-    "analysing_cap"     : "\033[32m",   # green
+    "testanalysing_cap"     : "\033[32m",   # green
     "test_cam"          : "\033[35m",   # magenta
     #"alert"             : "\033[31m",
 }
@@ -122,7 +122,7 @@ def main():
     print()
 
     # Build startup sequence
-    sequence = ["receive_stream", "send_image_stream", "analysing_cap"]
+    sequence = ["receive_stream", "send_image_stream", "testanalysing_cap"]
     if args.test:
         sequence.append("test_cam")
 

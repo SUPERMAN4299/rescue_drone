@@ -199,7 +199,7 @@ class DroneConfig:
     side_danger_frac:           float = 0.05
     human_hover_frac:           float = 0.08
     human_center_overlap_min:   float = 0.40
-    emergency_area_frac:        float = 0.60
+    emergency_area_frac:        float = 0.68   # v6: was 0.60 — less aggressive ES trigger
     safe_release_frac:          float = 0.35
 
     # ── Speed tier thresholds ─────────────────────────────────────────────
@@ -226,8 +226,8 @@ class DroneConfig:
     # ── Emergency timing ──────────────────────────────────────────────────
     emergency_hold_duration:    float = 2.5
     emergency_resend_interval:  float = 0.8
-    oscillation_guard_window:   float = 1.0
-    oscillation_guard_limit:    int   = 8
+    oscillation_guard_window:   float = 1.5   # v6: was 1.0 — wider window to count real osc.
+    oscillation_guard_limit:    int   = 12    # v6: was 8  — harder to trigger osc. emergency
 
     # ── Serial / heartbeat ────────────────────────────────────────────────
     command_send_interval:      float = 0.1
@@ -240,15 +240,15 @@ class DroneConfig:
     reader_fail_hold:           float = 1.5
 
     # ── Master arbiter cooldown ───────────────────────────────────────────
-    command_hold_time:          float = 0.35
+    command_hold_time:          float = 0.55   # v6: was 0.35 — longer dwell prevents flicker
 
     # ── Stability filters ─────────────────────────────────────────────────
-    nav_stability_min:          int   = 3
-    ai_stability_min:           int   = 3
-    ai_center_thresh:           float = 0.18
+    nav_stability_min:          int   = 5      # v6: was 3 — nav needs 5 consecutive agrees
+    ai_stability_min:           int   = 5      # v6: was 3 — AI intent needs 5 consecutive
+    ai_center_thresh:           float = 0.22   # v6: was 0.18 — wider dead-band stops L↔R jitter
 
     # ── Obstacle EMA ──────────────────────────────────────────────────────
-    depth_ema_alpha:            float = 0.45
+    depth_ema_alpha:            float = 0.25   # v6: was 0.45 — heavier smoothing on proximity
 
     # ── YOLO / camera ─────────────────────────────────────────────────────
     model:                      str   = "yolov8n.pt"
@@ -295,6 +295,25 @@ class DroneConfig:
 
     # ── IMPROVEMENT 7: Stale-command TTL ─────────────────────────────────
     stale_cmd_ttl:              float = 0.5   # discard queued cmds older than this
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  v6 STABILITY FIELDS  (no new subsystems — tuning only)
+    # ─────────────────────────────────────────────────────────────────────
+
+    # Fix 5: frames-without-target before entering SEARCH (prevents flicker)
+    search_enter_delay:         int   = 6     # missed-target frames before SEARCH
+
+    # Fix 4: minimum frames holding a LEFT/RIGHT intent before it can flip
+    lr_switch_cooldown:         int   = 6     # frames same L/R intent needed to switch
+
+    # Fix 7: minimum frames a FORWARD intent must persist before committing
+    forward_stability_min:      int   = 4     # frames for stable FORWARD commit
+
+    # Fix 6: secondary proximity EMA applied in analyse_obstacles (global)
+    obs_smooth_alpha:           float = 0.30  # extra per-tick smoothing on stored proximity
+
+    # Fix 8: frames of nav CAUTION/CLEAR before AI can override with forward motion
+    nav_override_guard:         int   = 3     # nav must be stable before AI forward allowed
 
     # ─────────────────────────────────────────────────────────────────────
     #  Hardware profiles (unchanged)
@@ -1080,6 +1099,13 @@ SMOOTH_FRAMES             = cfg.smooth_frames
 MAX_PWM_STEP              = cfg.max_pwm_step
 STALE_CMD_TTL             = cfg.stale_cmd_ttl
 
+# ── v6 stability constants ────────────────────────────────────────────────────
+_SEARCH_ENTER_DELAY       = cfg.search_enter_delay
+_LR_SWITCH_COOLDOWN       = cfg.lr_switch_cooldown
+_FORWARD_STABILITY_MIN    = cfg.forward_stability_min
+_OBS_SMOOTH_ALPHA         = cfg.obs_smooth_alpha
+_NAV_OVERRIDE_GUARD       = cfg.nav_override_guard
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  TORCH CPU THREAD TUNING (unchanged)
@@ -1197,6 +1223,11 @@ def _update_obstacle_memory(live: List[ObstacleInfo]) -> List[ObstacleInfo]:
     now = time.time()
     for obs in live:
         if obs.tid >= 0:
+            prev = _obstacle_memory.get(obs.tid)
+            if prev is not None:
+                # v6 Fix 6: secondary EMA on stored proximity to damp rapid changes
+                obs.proximity = (_OBS_SMOOTH_ALPHA * obs.proximity
+                                 + (1.0 - _OBS_SMOOTH_ALPHA) * prev.proximity)
             _obstacle_memory[obs.tid] = obs
     expired = [tid for tid, obs in _obstacle_memory.items()
                if now - obs.timestamp > LAST_OBSTACLE_TIMEOUT]
@@ -1259,7 +1290,7 @@ def _human_center_overlap(obs: ObstacleInfo, frame_w: int) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  AI DECISION LAYER  (v5: safe-test hover preference)
+#  AI DECISION LAYER  (v6: stronger smoothing, L↔R cooldown, search delay)
 # ══════════════════════════════════════════════════════════════════════════════
 
 _ai_state        = STATE_IDLE
@@ -1268,25 +1299,45 @@ _ai_decision_str = AI_SEARCH_TARGET
 _ai_prev_intent  = AI_SEARCH_TARGET
 _ai_same_count   = 0
 
+# v6 Fix 4: prevent rapid L↔R flipping
+_ai_last_lr_intent: str   = AI_HOVER   # last committed L or R intent
+_ai_lr_same_count:  int   = 0          # consecutive frames this L/R raw intent held
+
+# v6 Fix 5: delay before entering SEARCH after losing target
+_ai_no_target_frames: int = 0          # consecutive frames with no human box
+
 
 def ai_decision(boxes: list, frame_w: int, frame_h: int):
     """
     Layer-1 AI Intent — WHERE is the target?
 
-    v5 safe-test change: when target is found in SAFE_TEST_MODE,
-    prefer HOVER over any forward motion to minimise crash risk.
+    v6 stability changes (architecture unchanged):
+    • wider dead-band (_AI_CENTER_THRESH raised) stops L↔R jitter
+    • L↔R flip requires _LR_SWITCH_COOLDOWN consecutive frames of the new intent
+    • SEARCH_TARGET only committed after _SEARCH_ENTER_DELAY missed frames
+    • HOVER preferred when proximity is borderline or intent is ambiguous
+    • all existing safe-test and stability-counter logic preserved
     """
     global _ai_state, _ai_intent, _ai_decision_str
     global _ai_prev_intent, _ai_same_count
+    global _ai_last_lr_intent, _ai_lr_same_count
+    global _ai_no_target_frames
 
     frame_cx    = frame_w // 2
     human_boxes = [b for b in boxes if b[6] == HUMAN_CLASS]
 
     if not human_boxes:
+        _ai_no_target_frames += 1
         _ai_state  = STATE_SEARCHING
-        raw_intent = AI_SEARCH_TARGET
+        # v6 Fix 5: hold current intent until we've missed enough frames
+        if _ai_no_target_frames < _SEARCH_ENTER_DELAY:
+            # keep whatever intent was last committed — do not flip to SEARCH yet
+            return _ai_state, _ai_intent, None
+        raw_intent    = AI_SEARCH_TARGET
         target_center = None
     else:
+        _ai_no_target_frames = 0   # reset miss counter when target re-appears
+
         def _area(b):
             return (b[2]-b[0]) * (b[3]-b[1])
         best = max(human_boxes, key=_area)
@@ -1300,7 +1351,6 @@ def ai_decision(boxes: list, frame_w: int, frame_h: int):
         offset_frac = (cx - frame_cx) / frame_w
 
         if _mode_is_safe_test():
-            # IMPROVEMENT 1: in safe-test mode, prefer HOVER over movement
             raw_intent = AI_HOVER
         elif prox_frac >= HUMAN_HOVER_FRAC and abs(offset_frac) <= _AI_CENTER_THRESH:
             raw_intent = AI_HOVER
@@ -1311,8 +1361,25 @@ def ai_decision(boxes: list, frame_w: int, frame_h: int):
         else:
             raw_intent = AI_TRACK_CENTER
 
+        # v6 Fix 4: L↔R switch cooldown — must hold new L/R for N frames
+        if raw_intent in (AI_TRACK_LEFT, AI_TRACK_RIGHT):
+            if raw_intent == _ai_last_lr_intent:
+                _ai_lr_same_count += 1
+            else:
+                # New L/R direction — require cooldown before committing
+                if _ai_lr_same_count < _LR_SWITCH_COOLDOWN:
+                    # Not stable yet: prefer HOVER over switching immediately
+                    raw_intent = AI_HOVER
+                else:
+                    _ai_last_lr_intent = raw_intent
+                    _ai_lr_same_count  = 1
+        else:
+            # Not a L/R intent — decay the LR counter gently so a return is fast
+            _ai_lr_same_count = max(0, _ai_lr_same_count - 1)
+
         _ai_state = STATE_TRACKING
 
+    # Existing stability counter (unchanged logic)
     if raw_intent == _ai_prev_intent:
         _ai_same_count += 1
     else:
@@ -1539,6 +1606,11 @@ _nav_prev_raw     = NAV_SEARCH
 _nav_stable_count = 0
 _nav_final_cmd    = NAV_SEARCH
 
+# v6 Fix 7: forward-stability — count consecutive FORWARD raw decisions
+_nav_fwd_count: int = 0    # consecutive frames raw decision was a forward variant
+# v6 Fix 9: nav-override guard — track consecutive stable nav frames
+_nav_override_count: int = 0   # consecutive frames nav was CAUTION/CLEAR
+
 
 def _force_emergency_nav_state() -> None:
     global _nav_state, _nav_prev_raw, _nav_stable_count, _nav_final_cmd
@@ -1557,6 +1629,7 @@ def _force_emergency_nav_state() -> None:
 
 def nav_decision(boxes: list, frame_w: int, frame_h: int):
     global _nav_state, _nav_prev_raw, _nav_stable_count, _nav_final_cmd
+    global _nav_fwd_count, _nav_override_count
 
     t_start = time.perf_counter()
     _live_obs_for_emergency = _compute_live_obstacles(boxes, frame_w, frame_h)
@@ -1565,19 +1638,40 @@ def nav_decision(boxes: list, frame_w: int, frame_h: int):
     _nav_state = new_state
 
     if _check_emergency(raw_cmd, _nav_prev_raw, _live_obs_for_emergency):
+        _nav_fwd_count      = 0
+        _nav_override_count = 0
         _nav_final_cmd = NAV_EMERGENCY_STOP
         send_nav_token(ARDUINO_TOKENS[NAV_EMERGENCY_STOP], force=True)
         perf.record_command_latency((time.perf_counter() - t_start) * 1000)
         return _nav_final_cmd, obstacles, danger_obs
 
-    if raw_cmd == _nav_prev_raw:
+    # v6 Fix 7: track consecutive forward decisions for stability
+    _fwd_variants = (NAV_FAST_FORWARD, NAV_SLOW_FORWARD, NAV_FORWARD, NAV_FORWARD_SCAN)
+    if raw_cmd in _fwd_variants:
+        _nav_fwd_count += 1
+    else:
+        _nav_fwd_count = 0
+
+    # v6 Fix 9: track nav stability for override guard
+    if new_state in (NAV_STATE_CAUTION, NAV_STATE_CLEAR):
+        _nav_override_count += 1
+    else:
+        _nav_override_count = 0
+
+    # v6 Fix 7: don't commit forward motion until it has been stable long enough
+    effective_raw = raw_cmd
+    if raw_cmd in _fwd_variants and _nav_fwd_count < _FORWARD_STABILITY_MIN:
+        # Hold previous non-forward command (e.g. HOVER/SEARCH) while building confidence
+        effective_raw = _nav_final_cmd if _nav_final_cmd not in _fwd_variants else NAV_SAFE_SEARCH
+
+    if effective_raw == _nav_prev_raw:
         _nav_stable_count += 1
     else:
         _nav_stable_count = 1
-        _nav_prev_raw     = raw_cmd
+        _nav_prev_raw     = effective_raw
 
     if _nav_stable_count >= NAV_STABILITY_MIN:
-        if _nav_final_cmd != raw_cmd:
+        if _nav_final_cmd != effective_raw:
             _LEGACY_PRIORITY = {
                 NAV_EMERGENCY_STOP: 0, NAV_HOVER: 1,
                 NAV_BACKWARD: 2, NAV_AVOID_LEFT: 3, NAV_AVOID_RIGHT: 3,
@@ -1586,10 +1680,10 @@ def nav_decision(boxes: list, frame_w: int, frame_h: int):
                 NAV_SEARCH_LEFT: 7, NAV_SEARCH_RIGHT: 7, NAV_SEARCH: 7,
             }
             current_rank = _LEGACY_PRIORITY.get(_nav_final_cmd, 99)
-            new_rank     = _LEGACY_PRIORITY.get(raw_cmd, 99)
+            new_rank     = _LEGACY_PRIORITY.get(effective_raw, 99)
             if new_rank <= current_rank or current_rank >= 6:
-                _nav_final_cmd = raw_cmd
-                send_nav_token(ARDUINO_TOKENS.get(raw_cmd, "?"))
+                _nav_final_cmd = effective_raw
+                send_nav_token(ARDUINO_TOKENS.get(effective_raw, "?"))
 
     perf.record_command_latency((time.perf_counter() - t_start) * 1000)
     return _nav_final_cmd, obstacles, danger_obs
@@ -1614,46 +1708,110 @@ def classify_nav_state(nav_cmd: str, obstacles: list) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ARDUINO SERIAL CONTROLLER  (v5: stale-cmd TTL added)
+#  MOTION-PRIMITIVE → ARDUINO COMMAND TRANSLATION
+#
+#  The Arduino sketch (final_verdict_auto.ino) accepts:
+#    ARM | DISARM | STATUS | RECAL | RESETSTATS
+#    THROTTLE <0-200>
+#    ROLL  <±30°>
+#    PITCH <±30°>
+#    YAW   <±30°/s>
+#
+#  Each motion primitive maps to a (throttle, roll°, pitch°, yaw°/s) tuple.
+#  Values are relative to IDLE_THR=55; full forward flight uses ~130 throttle.
+#  Safe-test mode caps throttle automatically via cfg.safe_test_pwm_max scaling.
+#
+#  Sign conventions (X-frame, sketch mixMotors):
+#    Roll+  → right tilt   Pitch+ → nose-up   Yaw+ → clockwise (from above)
 # ══════════════════════════════════════════════════════════════════════════════
+
+# (throttle 0-200,  roll °,  pitch °,  yaw °/s)
+_MOTION_TO_FC: Dict[str, Tuple[int, float, float, float]] = {
+    MOVE_FORWARD        : (110,   0.0, -10.0,  0.0),   # gentle nose-down → forward
+    MOVE_FORWARD_FAST   : (140,   0.0, -18.0,  0.0),   # steeper pitch → fast forward
+    MOVE_FORWARD_SLOW   : ( 90,   0.0,  -6.0,  0.0),   # shallow pitch → slow forward
+    MOVE_BACKWARD       : ( 90,   0.0,  10.0,  0.0),   # nose-up → backward
+    MOVE_YAW_LEFT       : ( 80,   0.0,   0.0, -20.0),  # yaw-left rate setpoint
+    MOVE_YAW_RIGHT      : ( 80,   0.0,   0.0,  20.0),  # yaw-right rate setpoint
+    MOVE_HOVER          : ( 75,   0.0,   0.0,  0.0),   # level hover
+    MOVE_STOP           : ( 55,   0.0,   0.0,  0.0),   # back to idle throttle
+    MOVE_SEARCH_LEFT    : ( 70,   0.0,   0.0, -12.0),  # slow yaw scan left
+    MOVE_SEARCH_RIGHT   : ( 70,   0.0,   0.0,  12.0),  # slow yaw scan right
+    MOVE_SCAN_FORWARD   : ( 85,   0.0,  -5.0,  0.0),   # creep forward while scanning
+    MOVE_SAFE_SEARCH    : ( 65,   0.0,   0.0,  8.0),   # very slow yaw, low throttle
+    MOVE_EMERGENCY_STOP : (  0,   0.0,   0.0,  0.0),   # zero throttle → DISARM
+}
+
+# Throttle ceiling in safe-test mode (maps 0-200 to 0-safe_test_pwm_max)
+def _scale_throttle_safe_test(thr: int) -> int:
+    """Rescale throttle linearly so 200 → safe_test_pwm_max."""
+    if not _mode_is_safe_test():
+        return thr
+    return int(thr * cfg.safe_test_pwm_max / 200)
+
 
 import queue as _queue
 
 
 class ArduinoController(AbstractFlightController):
     """
-    Arduino Nano flight controller backend.
+    Arduino Nano flight controller — final_verdict_auto.ino protocol.
 
-    v5 additions
-    ─────────────
-    • Stale-command TTL: commands queued longer than STALE_CMD_TTL are
-      discarded before transmission to prevent acting on outdated states.
-    • All v4 features preserved: reconnect, deduplication, cooldown, HB.
+    Translates MotionPrimitive strings into the sketch's native serial
+    command set: ARM / DISARM / THROTTLE / ROLL / PITCH / YAW.
+
+    Key behaviours
+    ──────────────
+    • ARM on first motion command after connect; DISARM on EMERGENCY_STOP.
+    • Keepalive thread sends STATUS every 1 s to beat the sketch's 2 s
+      cmd-timeout failsafe (CMD_TO_MS 2000).  STATUS also refreshes
+      lastCmdMs on the Arduino side.
+    • Telemetry reader thread parses the sketch's 5 Hz [ARM]/[DIS] lines
+      and JSON STATUS responses, storing them in self.telemetry.
+    • Stale-command TTL preserved from v5: outdated commands are dropped.
+    • Full reconnect logic preserved from v5.
     """
+
+    # Keepalive must arrive faster than the sketch's CMD_TO_MS = 2000 ms
+    _KEEPALIVE_INTERVAL: float = 0.8   # seconds between STATUS pings
 
     def __init__(self, port: str = SERIAL_PORT_DEFAULT,
                  baud: int = SERIAL_BAUD_DEFAULT,
                  enabled: bool = False):
-        self.port         = port
-        self.baud         = baud
-        self.enabled      = enabled
-        self._ser         = None
-        self._last_token  = ""
-        self._last_send_t = 0.0
-        self._hb_thread   = None
-        self._hb_stop     = threading.Event()
-        self._lock        = threading.Lock()
-        self._cmd_queue: _queue.Queue = _queue.Queue(maxsize=8)
+        self.port          = port
+        self.baud          = baud
+        self.enabled       = enabled
+        self._ser          = None
+        self._last_motion  = ""
+        self._last_send_t  = 0.0
+        self._armed        = False
+        self._lock         = threading.Lock()
+        self._stop_evt     = threading.Event()
+        self._ka_thread:  Optional[threading.Thread] = None
+        self._telem_thread: Optional[threading.Thread] = None
+
+        # Latest telemetry parsed from the sketch's serial output
+        self.telemetry: Dict[str, object] = {
+            "state": "UNKNOWN", "roll": 0.0, "pitch": 0.0,
+            "imu": "UNKNOWN", "thr": 0,
+            "FL": 0, "FR": 0, "RR": 0, "RL": 0,
+            "hz": 0, "ovr": 0,
+        }
 
         if enabled:
             self._connect()
-            self._start_heartbeat()
+
+    # ── Connection ────────────────────────────────────────────────────
 
     def _connect(self) -> bool:
         try:
             import serial as _serial
             self._ser = _serial.Serial(self.port, self.baud, timeout=1)
+            time.sleep(2.0)        # allow Arduino bootloader to finish
+            self._ser.reset_input_buffer()
             event_log.log("SERIAL", f"Connected to {self.port} @ {self.baud} baud")
+            self._armed = False
+            self._start_background_threads()
             return True
         except Exception as exc:
             event_log.log("SERIAL", f"Could not open {self.port}: {exc}")
@@ -1661,87 +1819,254 @@ class ArduinoController(AbstractFlightController):
             return False
 
     def _reconnect(self) -> bool:
+        self._stop_evt.set()
         try:
             if self._ser and self._ser.is_open:
                 self._ser.close()
         except Exception:
             pass
-        self._ser = None
+        self._ser  = None
+        self._armed = False
+        self._stop_evt.clear()
         perf.increment_reconnect()
+        event_log.log("RECONNECT", "Attempting serial reconnect …")
+        time.sleep(1.0)
         return self._connect()
 
-    def send_token(self, token: str, force: bool = False) -> None:
-        now = time.time()
-        with self._lock:
-            if now - self._last_send_t < COMMAND_SEND_INTERVAL:
-                return
-            if not force and token == self._last_token:
-                return
+    # ── Background threads ────────────────────────────────────────────
 
-            # IMPROVEMENT 7 — Stale-command TTL
-            # A command enqueued then delayed (e.g. CPU load spike) is
-            # discarded rather than sent late to a different flight state.
-            self._last_token  = token
-            self._last_send_t = now
-            self._cmd_enqueue_time = now   # timestamp for TTL check
+    def _start_background_threads(self) -> None:
+        self._ka_thread = threading.Thread(
+            target=self._keepalive_loop, name="FC_Keepalive", daemon=True)
+        self._telem_thread = threading.Thread(
+            target=self._telemetry_loop, name="FC_Telemetry", daemon=True)
+        self._ka_thread.start()
+        self._telem_thread.start()
+        event_log.log("WATCHDOG",
+                      f"FC keepalive + telemetry threads started "
+                      f"(keepalive every {self._KEEPALIVE_INTERVAL}s)")
 
-        if not self.enabled:
-            return
+    def _keepalive_loop(self) -> None:
+        """
+        Sends STATUS every _KEEPALIVE_INTERVAL seconds.
+        Beats the Arduino's CMD_TO_MS=2000 ms cmd-timeout failsafe so the
+        drone does not auto-disarm during a pause in navigation commands.
+        """
+        while not self._stop_evt.is_set():
+            time.sleep(self._KEEPALIVE_INTERVAL)
+            if self._stop_evt.is_set():
+                break
+            with self._lock:
+                if self._armed:
+                    self._write_raw("STATUS")
 
-        # TTL check before write
-        age = time.time() - now
-        if age > STALE_CMD_TTL:
-            event_log.log("SERIAL",
-                          f"Stale cmd '{token}' discarded (age={age:.3f}s > TTL)")
-            return
+    def _telemetry_loop(self) -> None:
+        """
+        Reads lines from the Arduino and parses:
+          • JSON STATUS response  → self.telemetry dict
+          • 5 Hz telemetry line   → self.telemetry dict (subset)
+          • ARMED / DISARMED      → self._armed flag
+        """
+        import json as _json
+        buf = ""
+        while not self._stop_evt.is_set():
+            try:
+                if self._ser is None or not self._ser.is_open:
+                    time.sleep(0.1)
+                    continue
+                raw = self._ser.readline()
+                if not raw:
+                    continue
+                line = raw.decode(errors="ignore").strip()
+                if not line:
+                    continue
 
-        t0 = time.perf_counter()
-        self._write(token)
-        perf.record_serial_latency((time.perf_counter() - t0) * 1000)
+                event_log.log("SERIAL", f"FC→PC: {line}")
 
-    def send(self, token: str, force: bool = False) -> None:
-        self.send_token(token, force=force)
+                # JSON STATUS response  {"state":"ARMED","roll":...}
+                if line.startswith("{"):
+                    try:
+                        data = _json.loads(line)
+                        with self._lock:
+                            self.telemetry.update(data)
+                            self._armed = (data.get("state") == "ARMED")
+                    except _json.JSONDecodeError:
+                        pass
+                    continue
 
-    def _write(self, token: str) -> None:
-        payload = f"{token}\n".encode()
+                # 5 Hz telemetry  [ARM] R:0.12 P:-0.34 rPID:0.0 ...
+                if line.startswith("[ARM]") or line.startswith("[DIS]"):
+                    armed_now = line.startswith("[ARM]")
+                    with self._lock:
+                        self._armed = armed_now
+                        self.telemetry["state"] = "ARMED" if armed_now else "DISARMED"
+                    try:
+                        # Parse key:value pairs from telemetry line
+                        parts = line.split()
+                        tmap: Dict[str, str] = {}
+                        for part in parts[1:]:
+                            if ":" in part:
+                                k, v = part.split(":", 1)
+                                tmap[k] = v
+                        with self._lock:
+                            if "R" in tmap:
+                                self.telemetry["roll"]  = float(tmap["R"])
+                            if "P" in tmap:
+                                self.telemetry["pitch"] = float(tmap["P"])
+                            if "FL" in tmap:
+                                self.telemetry["FL"] = int(tmap["FL"])
+                            if "FR" in tmap:
+                                self.telemetry["FR"] = int(tmap["FR"])
+                            if "RR" in tmap:
+                                self.telemetry["RR"] = int(tmap["RR"])
+                            if "RL" in tmap:
+                                self.telemetry["RL"] = int(tmap["RL"])
+                            if "thr" in tmap:
+                                self.telemetry["thr"] = int(tmap["thr"])
+                    except (ValueError, KeyError):
+                        pass
+                    continue
+
+                # ARM / DISARM confirmations
+                if "ARMED" in line and "DISARMED" not in line:
+                    with self._lock:
+                        self._armed = True
+                        self.telemetry["state"] = "ARMED"
+                elif "DISARMED" in line:
+                    with self._lock:
+                        self._armed = False
+                        self.telemetry["state"] = "DISARMED"
+
+            except Exception as exc:
+                event_log.log("SERIAL", f"Telemetry read error: {exc}")
+                time.sleep(0.1)
+
+    # ── Raw serial write ──────────────────────────────────────────────
+
+    def _write_raw(self, cmd: str) -> None:
+        """Write a newline-terminated command string to serial."""
+        payload = f"{cmd}\n".encode()
         try:
             if self._ser is None or not self._ser.is_open:
                 if not self._reconnect():
                     return
             self._ser.write(payload)
         except Exception as exc:
-            event_log.log("SERIAL", f"Write error: {exc} — reconnecting")
+            event_log.log("SERIAL", f"Write error ({cmd!r}): {exc} — reconnecting")
             try:
                 if self._reconnect():
                     self._ser.write(payload)
             except Exception as exc2:
                 event_log.log("SERIAL", f"Reconnect write failed: {exc2}")
 
-    def _start_heartbeat(self) -> None:
-        self._hb_thread = threading.Thread(
-            target=self._heartbeat_loop, name="SerialHeartbeat", daemon=True
-        )
-        self._hb_thread.start()
-        event_log.log("WATCHDOG",
-                      f"Heartbeat thread started ({HEARTBEAT_INTERVAL}s interval)")
+    # ── Motion primitive → FC commands ───────────────────────────────
 
-    def _heartbeat_loop(self) -> None:
-        while not self._hb_stop.is_set():
-            time.sleep(HEARTBEAT_INTERVAL)
-            if self._hb_stop.is_set():
-                break
-            try:
-                self.send_token("HB", force=True)
-            except Exception:
-                pass
+    def send_motion(self, motion: str, force: bool = False) -> None:
+        """
+        Translate a MotionPrimitive string into Arduino serial commands
+        and transmit them.
+
+        Sequence per motion change:
+          1. ARM if not already armed (skip for EMERGENCY_STOP).
+          2. Send THROTTLE <n>
+          3. Send ROLL <f>
+          4. Send PITCH <f>
+          5. Send YAW <f>
+          6. DISARM if EMERGENCY_STOP.
+        """
+        if not self.enabled:
+            return
+
+        now = time.time()
+        with self._lock:
+            if not force and now - self._last_send_t < COMMAND_SEND_INTERVAL:
+                return
+            if not force and motion == self._last_motion:
+                return
+            # Stale-command TTL
+            age = time.time() - now
+            if age > STALE_CMD_TTL:
+                event_log.log("SERIAL",
+                              f"Stale motion '{motion}' discarded (age={age:.3f}s)")
+                return
+            self._last_motion = motion
+            self._last_send_t = now
+
+        t0 = time.perf_counter()
+
+        # ── Emergency: disarm immediately ─────────────────────────────
+        if motion == MOVE_EMERGENCY_STOP:
+            self._write_raw("DISARM")
+            with self._lock:
+                self._armed = False
+            event_log.log("SERIAL", "DISARM sent — EMERGENCY_STOP")
+            perf.record_serial_latency((time.perf_counter() - t0) * 1000)
+            return
+
+        # ── Arm if needed ─────────────────────────────────────────────
+        with self._lock:
+            currently_armed = self._armed
+        if not currently_armed:
+            self._write_raw("ARM")
+            event_log.log("SERIAL", "ARM sent")
+            time.sleep(0.05)   # brief pause for the sketch to process arm checks
+
+        # ── Look up setpoints ─────────────────────────────────────────
+        thr, roll, pitch, yaw = _MOTION_TO_FC.get(
+            motion, _MOTION_TO_FC[MOVE_HOVER])
+
+        thr = _scale_throttle_safe_test(thr)
+
+        # ── Send all four setpoints ───────────────────────────────────
+        self._write_raw(f"THROTTLE {thr}")
+        self._write_raw(f"ROLL {roll:.1f}")
+        self._write_raw(f"PITCH {pitch:.1f}")
+        self._write_raw(f"YAW {yaw:.1f}")
+
+        perf.record_serial_latency((time.perf_counter() - t0) * 1000)
+        event_log.log("SERIAL",
+                      f"motion={motion} → THR={thr} R={roll} P={pitch} Y={yaw}")
+
+    def send_token(self, token: str, force: bool = False) -> None:
+        """
+        Legacy single-token interface retained for compatibility.
+        The token is reverse-mapped to a MotionPrimitive where possible;
+        otherwise treated as a raw Arduino command (e.g. 'STATUS').
+        """
+        # Reverse-map Arduino token → motion primitive string
+        _TOKEN_TO_MOTION: Dict[str, str] = {v: k for k, v in ARDUINO_TOKENS.items()
+                                             if k in _MOTION_TO_FC}
+        motion = _TOKEN_TO_MOTION.get(token)
+        if motion:
+            self.send_motion(motion, force=force)
+        else:
+            # Raw command (STATUS, RECAL, RESETSTATS, HB ignored)
+            if token not in ("HB",):
+                with self._lock:
+                    self._write_raw(token)
+
+    def get_telemetry(self) -> Dict[str, object]:
+        with self._lock:
+            return dict(self.telemetry)
 
     def is_connected(self) -> bool:
         return self._ser is not None and self._ser.is_open
 
+    def is_armed(self) -> bool:
+        with self._lock:
+            return self._armed
+
     def close(self) -> None:
-        self._hb_stop.set()
-        if self._hb_thread and self._hb_thread.is_alive():
-            self._hb_thread.join(timeout=2.0)
+        self._stop_evt.set()
+        # Disarm safely before closing
+        if self.enabled and self._armed:
+            try:
+                self._write_raw("DISARM")
+            except Exception:
+                pass
+        for t in (self._ka_thread, self._telem_thread):
+            if t and t.is_alive():
+                t.join(timeout=2.0)
         try:
             if self._ser and self._ser.is_open:
                 self._ser.close()
@@ -1762,6 +2087,20 @@ arduino = flight_controller   # legacy alias
 
 
 def send_nav_token(token: str, force: bool = False) -> None:
+    """
+    Dispatch a navigation token to the flight controller.
+    In REAL_FLIGHT_MODE the ArduinoController translates the motion
+    primitive into proper ARM/THROTTLE/ROLL/PITCH/YAW commands.
+    In all other modes the DryRunController no-ops.
+    """
+    if isinstance(flight_controller, ArduinoController):
+        # Prefer the full motion translation path
+        _TOKEN_TO_MOTION: Dict[str, str] = {v: k for k, v in ARDUINO_TOKENS.items()
+                                             if k in _MOTION_TO_FC}
+        motion = _TOKEN_TO_MOTION.get(token)
+        if motion:
+            flight_controller.send_motion(motion, force=force)
+            return
     flight_controller.send_token(token, force=force)
 
 
@@ -1832,11 +2171,24 @@ def master_decision(nav_cmd:      str,
                                 for o in obstacles)
             motion = MOVE_HOVER if right_blocked else MOVE_YAW_RIGHT
         elif ai_intent == AI_TRACK_CENTER:
-            # IMPROVEMENT 1: safe-test caps forward motion
+            # v6 Fix 9: only allow AI to push forward when nav has been stable
+            # (prevents AI from fighting nav that just changed to CAUTION)
+            nav_stable_enough = _nav_override_count >= _NAV_OVERRIDE_GUARD
             motion = MOVE_FORWARD_SLOW if (nav_state == NAV_STATE_CAUTION
-                                           or _mode_is_safe_test()) else MOVE_FORWARD_FAST
+                                           or _mode_is_safe_test()
+                                           or not nav_stable_enough) else MOVE_FORWARD_FAST
         else:
             motion = MOVE_HOVER
+
+        # v6 Fix 8: if the last committed motion was the opposite direction, insert
+        # a HOVER buffer frame to prevent snapping directly between opposing motions
+        _opposing = {
+            MOVE_YAW_LEFT:  MOVE_YAW_RIGHT,
+            MOVE_YAW_RIGHT: MOVE_YAW_LEFT,
+        }
+        if _opposing.get(motion) == _master_motion:
+            motion = MOVE_HOVER   # one-frame HOVER buffer
+
         _commit_motion(motion, OWNER_AI, now)
 
     # ── Priority 4: NAVIGATION forward / search ───────────────────────────
