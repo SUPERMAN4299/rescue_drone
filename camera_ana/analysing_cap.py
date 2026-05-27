@@ -242,7 +242,7 @@ def ai_decision(boxes: list, frame_w: int, frame_h: int):
     if _ai_same_count >= _AI_STABILITY_MIN:
         if _ai_decision_str != raw_cmd:
             _ai_decision_str = raw_cmd
-            print(f"[AI] {_ai_decision_str}")
+            # NOTE: logging suppressed here — [MASTER] arbiter logs the final cmd
 
     return _ai_state, _ai_decision_str, target_center
 
@@ -436,6 +436,42 @@ def _update_obstacle_memory(live_obstacles: list[ObstacleInfo]) -> list[Obstacle
 #  OBSTACLE ANALYSIS  (upgrade 1 + 7 + 10 integrated)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _compute_live_obstacles(boxes: list,
+                             frame_w: int,
+                             frame_h: int) -> list[ObstacleInfo]:
+    """
+    Compute ObstacleInfo for current-frame boxes WITHOUT merging obstacle memory.
+
+    Used exclusively by the emergency layer so recovery decisions are based
+    on what is visible NOW, not on EMA-smoothed or remembered detections.
+    Mirrors analyse_obstacles but skips _update_obstacle_memory.
+    """
+    now  = time.time()
+    live: list[ObstacleInfo] = []
+    for (x1, y1, x2, y2, conf, tid, cls_id) in boxes:
+        if cls_id not in NAVIGATION_CLASSES:
+            continue
+        cx        = (x1 + x2) // 2
+        cy        = (y1 + y2) // 2
+        # Use raw (non-EMA) proximity for the emergency gate so smoothed
+        # history cannot keep the value artificially high after obstacle clears.
+        proximity = estimate_pseudo_depth_v3(x1, y1, x2, y2, frame_w, frame_h, tid=-1)
+        zone      = classify_horizontal_zone(cx, frame_w)
+        v_zone    = classify_vertical_zone(cy, frame_h)
+        is_human  = (cls_id == HUMAN_CLASS)
+        live.append(ObstacleInfo(
+            box=      (x1, y1, x2, y2),
+            proximity=proximity,
+            zone=     zone,
+            v_zone=   v_zone,
+            is_human= is_human,
+            tid=      tid,
+            cls_id=   cls_id,
+            timestamp=now,
+        ))
+    return live
+
+
 def analyse_obstacles(boxes: list,
                       frame_w: int,
                       frame_h: int) -> list[ObstacleInfo]:
@@ -616,11 +652,34 @@ def _next_search_state(obstacles: list[ObstacleInfo]) -> str:
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  UPGRADE 11 — EMERGENCY SAFETY LAYER  (oscillation guard state)
+#  PATCH 7 — Full FSM with hysteresis and proper recovery
 # ══════════════════════════════════════════════════════════════════════════════
 
 _oscillation_timestamps: deque = deque()   # timestamps of dangerous command changes
-_emergency_active: bool = False
-_emergency_start:  float = 0.0
+
+# ── Emergency FSM state ───────────────────────────────────────────────────────
+# Three explicit phases:
+#   IDLE      → normal navigation, no emergency active
+#   ACTIVE    → emergency hold (drone stopped, sending ES)
+#   RECOVERY  → hold elapsed, waiting for proximity to drop below SAFE_RELEASE_FRAC
+#               before returning to IDLE.  Prevents immediate re-entry flicker.
+_EMERG_IDLE     = "IDLE"
+_EMERG_ACTIVE   = "ACTIVE"
+_EMERG_RECOVERY = "RECOVERY"
+
+_emergency_phase:      str   = _EMERG_IDLE
+_emergency_start_time: float = 0.0
+_emergency_reason:     str   = ""
+
+# ES token spam guard: track when ES was last transmitted so we only re-send
+# periodically (watchdog keepalive) rather than every frame.
+_emergency_last_sent:  float = 0.0
+EMERGENCY_RESEND_INTERVAL: float = 0.8   # seconds between repeat ES tokens
+
+# Hysteresis thresholds — entry is aggressive, exit is conservative.
+# EMERGENCY_AREA_FRAC defined earlier (0.60) is used for entry.
+SAFE_RELEASE_FRAC: float = 0.35   # proximity must drop below this to exit recovery
+
 # PATCH 3 — Extended from 1.5 s to 2.5 s.
 # 1.5 s was too short for WiFi jitter / temporary stream freezes; the
 # emergency could release before the hazard fully cleared.  2.5 s gives
@@ -672,50 +731,130 @@ def _is_dangerous_oscillation(cmd_a: str, cmd_b: str) -> bool:
 
 def _check_emergency(raw_cmd: str,
                      prev_raw: str,
-                     obstacles: list[ObstacleInfo]) -> bool:
+                     live_obstacles: list[ObstacleInfo]) -> bool:
     """
-    Return True if EMERGENCY_STOP should be issued.
+    Three-phase emergency FSM: IDLE → ACTIVE → RECOVERY → IDLE.
 
-    Three triggers:
-      (a) Any object fills ≥ EMERGENCY_AREA_FRAC of the frame → imminent collision
-      (b) Command oscillation: >OSCILLATION_GUARD_LIMIT changes in 1 second
-      (c) Emergency is already active and hold duration has not elapsed
+    PATCH 7 — Full FSM with hysteresis to fix permanent-latch bug.
+
+    Phases
+    ------
+    IDLE:
+      • Evaluate entry triggers (giant obstacle, oscillation).
+      • If triggered → transition to ACTIVE, log entry.
+
+    ACTIVE (hold phase):
+      • Always return True (ES) for EMERGENCY_HOLD_DURATION seconds.
+      • Resend ES token periodically (watchdog keepalive, not every frame).
+      • After hold elapses → transition to RECOVERY, log hold complete.
+
+    RECOVERY:
+      • Still return True (ES) until current-frame proximity drops below
+        SAFE_RELEASE_FRAC on ALL live obstacles (hysteresis exit gate).
+      • Key fix: uses ONLY live_obstacles (current frame detections, no
+        obstacle memory, no EMA history) so stale values cannot block
+        recovery indefinitely.
+      • If safe → transition to IDLE, log release.
+      • If still unsafe → remain in RECOVERY, log blocked reason.
+
+    Oscillation guard accumulates across all phases; cleared on ACTIVE entry.
+
+    Parameters
+    ----------
+    raw_cmd        : current raw navigation command (for oscillation check)
+    prev_raw       : previous raw navigation command
+    live_obstacles : obstacles from CURRENT frame only — NOT obstacle memory.
+                     Caller (nav_decision) must pass pre-memory-merge live list.
     """
-    global _emergency_active, _emergency_start
+    global _emergency_phase, _emergency_start_time, _emergency_reason
+    global _emergency_last_sent
 
     now = time.time()
 
-    # Trigger (c): hold active emergency
-    if _emergency_active:
-        if now - _emergency_start < EMERGENCY_HOLD_DURATION:
-            return True
-        _emergency_active = False   # release after hold
-
-    # Trigger (a): giant obstacle
-    for obs in obstacles:
-        if obs.proximity >= EMERGENCY_AREA_FRAC:
-            _emergency_active = True
-            _emergency_start  = now
-            print(f"[EMERGENCY] Obstacle at {obs.proximity*100:.0f}% proximity → STOP")
-            return True
-
-    # Trigger (b): oscillation guard — FIX 8
-    # Only dangerous axis-reversals (e.g. AVOID_LEFT↔AVOID_RIGHT, FORWARD↔BACKWARD)
-    # are counted.  Speed-tier steps, search sub-states, and hover transitions are
-    # intentional and must not contribute to the oscillation counter.
+    # ── Oscillation accumulation (runs in all phases) ─────────────────────
     if _is_dangerous_oscillation(raw_cmd, prev_raw):
         _oscillation_timestamps.append(now)
-    # Prune entries older than the window
-    while _oscillation_timestamps and (now - _oscillation_timestamps[0]) > OSCILLATION_GUARD_WINDOW:
+    while (_oscillation_timestamps
+           and (now - _oscillation_timestamps[0]) > OSCILLATION_GUARD_WINDOW):
         _oscillation_timestamps.popleft()
 
-    if len(_oscillation_timestamps) > OSCILLATION_GUARD_LIMIT:
-        _emergency_active = True
-        _emergency_start  = now
-        _oscillation_timestamps.clear()
-        print("[EMERGENCY] Oscillation detected → STOP")
-        return True
+    # ══════════════════════════════════════════════════════════════════════
+    #  PHASE: IDLE  — evaluate entry triggers
+    # ══════════════════════════════════════════════════════════════════════
+    if _emergency_phase == _EMERG_IDLE:
 
+        # Trigger A: large obstacle in current frame
+        for obs in live_obstacles:
+            if obs.proximity >= EMERGENCY_AREA_FRAC:
+                _emergency_phase      = _EMERG_ACTIVE
+                _emergency_start_time = now
+                _emergency_reason     = f"obstacle {obs.proximity*100:.0f}% >= {EMERGENCY_AREA_FRAC*100:.0f}%"
+                _emergency_last_sent  = 0.0   # force immediate ES send
+                _oscillation_timestamps.clear()
+                print(f"[EMERGENCY] Entered — {_emergency_reason}")
+                return True
+
+        # Trigger B: command oscillation
+        if len(_oscillation_timestamps) > OSCILLATION_GUARD_LIMIT:
+            _emergency_phase      = _EMERG_ACTIVE
+            _emergency_start_time = now
+            _emergency_reason     = "oscillation guard"
+            _emergency_last_sent  = 0.0
+            _oscillation_timestamps.clear()
+            print(f"[EMERGENCY] Entered — {_emergency_reason}")
+            return True
+
+        return False   # IDLE, no trigger
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  PHASE: ACTIVE  — hold for EMERGENCY_HOLD_DURATION
+    # ══════════════════════════════════════════════════════════════════════
+    if _emergency_phase == _EMERG_ACTIVE:
+        elapsed = now - _emergency_start_time
+
+        if elapsed < EMERGENCY_HOLD_DURATION:
+            # Periodic resend so Arduino watchdog stays alive (not every frame)
+            if now - _emergency_last_sent >= EMERGENCY_RESEND_INTERVAL:
+                _emergency_last_sent = now
+                print(f"[EMERGENCY] Holding ({elapsed:.1f}s / {EMERGENCY_HOLD_DURATION:.1f}s)")
+            return True
+
+        # Hold elapsed → enter recovery
+        _emergency_phase      = _EMERG_RECOVERY
+        _emergency_start_time = now   # reuse as recovery start for logging
+        print("[EMERGENCY] Hold elapsed → entering RECOVERY phase")
+        # Fall through to RECOVERY check immediately this frame
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  PHASE: RECOVERY  — wait for proximity to drop (hysteresis exit gate)
+    #  CRITICAL: use live_obstacles ONLY — no EMA, no obstacle memory.
+    #  This prevents stale/smoothed proximity values from blocking recovery.
+    # ══════════════════════════════════════════════════════════════════════
+    if _emergency_phase == _EMERG_RECOVERY:
+
+        # Collect max proximity from LIVE (current-frame) detections only.
+        # No obstacle — proximity is 0.0 → safe to release.
+        max_live_prox = max(
+            (obs.proximity for obs in live_obstacles),
+            default=0.0
+        )
+
+        if max_live_prox < SAFE_RELEASE_FRAC:
+            # Safe conditions confirmed → release emergency
+            _emergency_phase  = _EMERG_IDLE
+            _emergency_reason = ""
+            print(f"[EMERGENCY] Released — max live proximity {max_live_prox*100:.0f}% "
+                  f"< {SAFE_RELEASE_FRAC*100:.0f}% threshold")
+            return False   # IDLE: normal navigation resumes
+
+        # Still unsafe — remain in recovery, log periodically
+        if now - _emergency_last_sent >= EMERGENCY_RESEND_INTERVAL:
+            _emergency_last_sent = now
+            print(f"[EMERGENCY] Recovery blocked — live proximity {max_live_prox*100:.0f}% "
+                  f">= release threshold {SAFE_RELEASE_FRAC*100:.0f}%")
+        return True   # hold ES until clear
+
+    # Fallback (should never reach here)
     return False
 
 
@@ -873,12 +1012,18 @@ def _force_emergency_nav_state() -> None:
     display loop thread) and does not touch the YOLO or reader threads.
     """
     global _nav_state, _nav_prev_raw, _nav_stable_count, _nav_final_cmd
-    _nav_final_cmd    = NAV_EMERGENCY_STOP
-    _nav_state        = NAV_EMERGENCY_STOP
-    _nav_prev_raw     = NAV_EMERGENCY_STOP
-    # Reset stability counter so the first non-emergency command must re-earn
-    # its stability window before overriding the emergency state.
-    _nav_stable_count = 0
+    global _emergency_phase, _emergency_start_time, _emergency_reason, _emergency_last_sent
+    _nav_final_cmd        = NAV_EMERGENCY_STOP
+    _nav_state            = NAV_EMERGENCY_STOP
+    _nav_prev_raw         = NAV_EMERGENCY_STOP
+    _nav_stable_count     = 0
+    # Force FSM into ACTIVE phase so it holds for the full duration
+    if _emergency_phase == _EMERG_IDLE:
+        _emergency_phase      = _EMERG_ACTIVE
+        _emergency_start_time = time.time()
+        _emergency_reason     = "forced (stale frame / reader failure)"
+        _emergency_last_sent  = 0.0
+        print(f"[EMERGENCY] Entered — {_emergency_reason}")
 
 
 def nav_decision(boxes: list,
@@ -904,17 +1049,19 @@ def nav_decision(boxes: list,
     """
     global _nav_state, _nav_prev_raw, _nav_stable_count, _nav_final_cmd
 
+    # Compute LIVE obstacles (before temporal memory merge) for the emergency
+    # layer.  analyse_obstacles merges memory internally; we need the raw
+    # current-frame list so the recovery gate isn't blocked by stale EMA values.
+    _live_obs_for_emergency = _compute_live_obstacles(boxes, frame_w, frame_h)
     obstacles = analyse_obstacles(boxes, frame_w, frame_h)
     raw_cmd, new_state, danger_obs = _nav_raw_decision_v3(obstacles, frame_w, frame_h)
 
     _nav_state = new_state
 
     # ── UPGRADE 11: Emergency override (checked before stability filter) ──
-    if _check_emergency(raw_cmd, _nav_prev_raw, obstacles):
+    if _check_emergency(raw_cmd, _nav_prev_raw, _live_obs_for_emergency):
         _nav_final_cmd = NAV_EMERGENCY_STOP
-        token = ARDUINO_TOKENS[NAV_EMERGENCY_STOP]
-        print(f"[NAV] {_nav_final_cmd}  →  Arduino token: '{token}'")
-        send_nav_token(token, force=True)   # FIX 7: force-send emergency
+        send_nav_token(ARDUINO_TOKENS[NAV_EMERGENCY_STOP], force=True)
         return _nav_final_cmd, obstacles, danger_obs
 
     # ── Stability filter ────────────────────────────────────────────────────
@@ -952,11 +1099,196 @@ def nav_decision(boxes: list,
             # — OR if current state is already a search/forward (low priority).
             if new_rank <= current_rank or current_rank >= 6:
                 _nav_final_cmd = raw_cmd
-                token = ARDUINO_TOKENS.get(raw_cmd, "?")
-                print(f"[NAV] {_nav_final_cmd}  →  Arduino token: '{token}'")
-                send_nav_token(token)   # FIX 7: send on every command change
+                send_nav_token(ARDUINO_TOKENS.get(raw_cmd, "?"))   # keep serial hot
 
     return _nav_final_cmd, obstacles, danger_obs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MASTER COMMAND ARBITER
+#  Single authority that arbitrates among all sub-systems and emits the one
+#  final motor command.  Architecture:
+#
+#    PERCEPTION (YOLO)
+#         │
+#    ┌────┴──────────────────────────────────────────────────┐
+#    │  Emergency FSM  │  Nav avoidance FSM  │  AI tracking  │
+#    └────┬──────────────────────────────────────────────────┘
+#         │  all candidates → master_decision()
+#         ▼
+#    MASTER ARBITER  (priority + cooldown)
+#         │
+#    Arduino serial token
+#
+#  Priority (highest→lowest):
+#    1. EMERGENCY  — any emergency phase active or stale/dead stream
+#    2. NAVIGATION — avoidance states (BACKWARD, AVOID_*, STOP, SAFE_SEARCH,
+#                    SLOW_FORWARD, speed-tier STOP, FORWARD_SCAN)
+#    3. AI_TRACKING — human tracking (FORWARD/LEFT/RIGHT/HOVER) when safe
+#    4. SEARCH     — exploration FSM when no target and path is clear
+#
+#  Command cooldown: commands may not change faster than COMMAND_HOLD_TIME
+#  unless the new command is EMERGENCY_STOP or BACKWARD (safety override).
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Owner labels shown on HUD
+OWNER_EMERGENCY  = "EMERGENCY"
+OWNER_NAVIGATION = "NAVIGATION"
+OWNER_AI         = "AI_TRACKING"
+OWNER_SEARCH     = "SEARCH"
+
+# Minimum wall-clock seconds a command is held before another non-critical
+# command may replace it.  Prevents sub-frame jitter from thrashing the drone.
+COMMAND_HOLD_TIME: float = 0.35
+
+# Navigation avoidance commands that indicate an active obstacle response.
+# When any of these is the current nav output, AI tracking is suppressed.
+_NAV_AVOIDANCE_CMDS: frozenset[str] = frozenset({
+    NAV_BACKWARD,
+    NAV_AVOID_LEFT,
+    NAV_AVOID_RIGHT,
+    NAV_STOP,
+    NAV_SAFE_SEARCH,
+    NAV_SLOW_FORWARD,   # caution-speed counts as avoidance-influenced
+})
+
+# AI commands allowed to control the drone when no higher priority is active.
+_AI_ALLOWED_CMDS: frozenset[str] = frozenset({
+    "FORWARD", "LEFT", "RIGHT", "HOVER",
+    NAV_FORWARD,        # ai_decision outputs these string variants
+    NAV_HOVER,
+    NAV_FAST_FORWARD,
+})
+
+# Module-level arbiter state
+_master_cmd:         str   = NAV_SEARCH
+_master_owner:       str   = OWNER_SEARCH
+_master_last_change: float = 0.0
+
+
+def master_decision(nav_cmd:    str,
+                    ai_cmd:     str,
+                    ai_state:   str,
+                    obstacles:  list,
+                    stale_frame: bool,
+                    reader_alive: bool) -> tuple[str, str]:
+    """
+    Master Command Arbiter — sole source of final drone commands.
+
+    Parameters
+    ----------
+    nav_cmd      : output of nav_decision() (already stability-filtered)
+    ai_cmd       : output of ai_decision() (_ai_decision_str)
+    ai_state     : STATE_TRACKING / STATE_SEARCHING / STATE_IDLE
+    obstacles    : merged obstacle list from nav_decision()
+    stale_frame  : True if video feed has frozen (FIX 2 stale check)
+    reader_alive : True if frame-reader thread is alive
+
+    Returns
+    -------
+    (final_cmd, owner)  — final_cmd is sent to Arduino; owner labels HUD.
+    """
+    global _master_cmd, _master_owner, _master_last_change
+
+    now = time.time()
+
+    # ── PRIORITY 1: EMERGENCY ─────────────────────────────────────────────
+    # Absolute override — nothing may suppress it.
+    # Triggers: emergency FSM active, stale frame, reader dead, or nav
+    # itself already escalated to EMERGENCY_STOP.
+    emergency_active = (_emergency_phase != _EMERG_IDLE)
+    if (emergency_active
+            or stale_frame
+            or not reader_alive
+            or nav_cmd == NAV_EMERGENCY_STOP):
+        candidate = NAV_EMERGENCY_STOP
+        owner     = OWNER_EMERGENCY
+        # Cooldown bypassed for emergency — always apply immediately
+        _commit(candidate, owner, now, force=True)
+        return _master_cmd, _master_owner
+
+    # ── PRIORITY 2: NAVIGATION avoidance FSM ──────────────────────────────
+    # Active when nav has detected an obstacle requiring evasive action.
+    # AI tracking is completely suppressed in this state.
+    if nav_cmd in _NAV_AVOIDANCE_CMDS:
+        candidate = nav_cmd
+        owner     = OWNER_NAVIGATION
+        _commit(candidate, owner, now)
+        return _master_cmd, _master_owner
+
+    # ── PRIORITY 3: AI TRACKING ───────────────────────────────────────────
+    # Only allowed when:
+    #   • no avoidance active (checked above)
+    #   • AI is actively tracking a human (STATE_TRACKING)
+    #   • AI command is a meaningful directional/hover command
+    if (ai_state == STATE_TRACKING
+            and ai_cmd in _AI_ALLOWED_CMDS):
+        # Map ai_decision string variants to canonical NAV constants
+        _AI_CMD_MAP = {
+            "FORWARD": NAV_FAST_FORWARD,
+            "LEFT"   : NAV_AVOID_LEFT,    # AI left → drone yaw/strafe left
+            "RIGHT"  : NAV_AVOID_RIGHT,
+            "HOVER"  : NAV_HOVER,
+        }
+        canonical = _AI_CMD_MAP.get(ai_cmd, ai_cmd)
+        candidate = canonical
+        owner     = OWNER_AI
+        _commit(candidate, owner, now)
+        return _master_cmd, _master_owner
+
+    # ── PRIORITY 4: NAVIGATION forward / speed tiers ──────────────────────
+    # Nav has a valid non-avoidance command (FAST_FORWARD, FORWARD_SCAN…).
+    # Covers the case where AI has no target but nav sees a clear path.
+    if nav_cmd not in (NAV_SEARCH, NAV_SEARCH_LEFT, NAV_SEARCH_RIGHT,
+                       NAV_SAFE_SEARCH, NAV_FORWARD_SCAN):
+        candidate = nav_cmd
+        owner     = OWNER_NAVIGATION
+        _commit(candidate, owner, now)
+        return _master_cmd, _master_owner
+
+    # ── PRIORITY 5 (lowest): SEARCH FSM ──────────────────────────────────
+    # Activated only when no target and no obstacle danger.
+    candidate = nav_cmd   # search sub-states come from nav_decision / _next_search_state
+    owner     = OWNER_SEARCH
+    _commit(candidate, owner, now)
+    return _master_cmd, _master_owner
+
+
+def _commit(candidate: str, owner: str, now: float, force: bool = False) -> None:
+    """
+    Apply candidate command if cooldown allows or force=True.
+
+    Cooldown is bypassed for:
+      • EMERGENCY_STOP  (always immediate)
+      • BACKWARD        (safety-critical reversal)
+      • Any command when force=True is passed
+
+    A change is logged as [MASTER] only when the final command or owner
+    actually changes — no duplicate prints.
+    """
+    global _master_cmd, _master_owner, _master_last_change
+
+    # Safety overrides bypass cooldown entirely
+    bypass_cooldown = (force
+                       or candidate == NAV_EMERGENCY_STOP
+                       or candidate == NAV_BACKWARD)
+
+    elapsed_since_change = now - _master_last_change
+    if not bypass_cooldown and elapsed_since_change < COMMAND_HOLD_TIME:
+        # Cooldown active — keep current command
+        return
+
+    if candidate == _master_cmd and owner == _master_owner:
+        return   # no change; nothing to do
+
+    prev_cmd   = _master_cmd
+    _master_cmd         = candidate
+    _master_owner       = owner
+    _master_last_change = now
+
+    token = ARDUINO_TOKENS.get(candidate, "?")
+    print(f"[MASTER] {owner:12s} → {candidate:20s}  (was: {prev_cmd})  token: '{token}'")
+    send_nav_token(token, force=force)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1356,13 +1688,20 @@ def draw_nav_overlay(frame: np.ndarray,
     visible_obs = [o for o in obstacles if o.proximity >= SIDE_DANGER_FRAC * 0.7]
     draw_danger_boxes(frame, visible_obs)
 
-    # ── UPGRADE 11: Emergency banner ──────────────────────────────────────
+    # ── UPGRADE 11: Emergency / Recovery banner ───────────────────────────
     if nav_cmd == NAV_EMERGENCY_STOP:
-        banner = "⚠⚠  EMERGENCY STOP  ⚠⚠"
+        # Check if we're in the recovery phase for a different banner colour
+        in_recovery = (_emergency_phase == _EMERG_RECOVERY)
+        if in_recovery:
+            banner       = "⚠  RECOVERING FROM EMERGENCY  ⚠"
+            banner_color = (0, 140, 200)   # amber-ish blue — distinct from full ES
+        else:
+            banner       = "⚠⚠  EMERGENCY STOP  ⚠⚠"
+            banner_color = (0, 0, 220)
         (bw, bh), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.80, 2)
         bx = (frame_w - bw) // 2
         by = 36
-        cv2.rectangle(frame, (0, 0), (frame_w, by + 10), (0, 0, 220), -1)
+        cv2.rectangle(frame, (0, 0), (frame_w, by + 10), banner_color, -1)
         cv2.putText(frame, banner, (bx, by),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.80, (255, 255, 255), 2)
 
@@ -1978,30 +2317,18 @@ def main():
 
             frame, _ = _get_latest_frame()
 
-            # ── FIX 2: Stale frame emergency ─────────────────────────────
-            # Even if the reader is alive, the frame timestamp may be stale
-            # (VideoCapture hanging, stream frozen, network stall).
-            stale = (time.time() - _last_frame_timestamp) > STALE_FRAME_TIMEOUT
-            if stale:
-                # PATCH 1: synchronise internal nav FSM state BEFORE rendering
-                # so HUD, overlays, and _nav_final_cmd all show EMERGENCY_STOP.
-                _force_emergency_nav_state()
-                # Force EMERGENCY_STOP — override nav stack output
-                send_nav_token(ARDUINO_TOKENS[NAV_EMERGENCY_STOP], force=True)
+            # ── Stale/missing frame: render ES overlay on last known frame ──
+            # master_decision() handles stale_frame=True with EMERGENCY priority.
+            # We still need to pump the display so the window stays responsive.
+            stale_now = (time.time() - _last_frame_timestamp) > STALE_FRAME_TIMEOUT
+            if stale_now or frame is None:
                 if last_display_frame is not None:
-                    # Re-render nav overlay on the stale frame with correct state
-                    _render_stale_overlay(last_display_frame)
-                    draw_nav_overlay(last_display_frame, NAV_EMERGENCY_STOP,
-                                     [], None, last_display_frame.shape[1],
-                                     last_display_frame.shape[0])
-                    cv2.imshow("Human Detection",
-                               _scale_frame_for_display(last_display_frame))
-                if cv2.waitKey(10) & 0xFF == ord('q'):
-                    break
-                continue
-
-            if frame is None:
-                if last_display_frame is not None:
+                    if stale_now:
+                        _render_stale_overlay(last_display_frame)
+                        _force_emergency_nav_state()
+                        draw_nav_overlay(last_display_frame, NAV_EMERGENCY_STOP,
+                                         [], None, last_display_frame.shape[1],
+                                         last_display_frame.shape[0])
                     cv2.imshow("Human Detection",
                                _scale_frame_for_display(last_display_frame))
                 if cv2.waitKey(10) & 0xFF == ord('q'):
@@ -2030,13 +2357,23 @@ def main():
 
             h_disp, w_disp = display_frame.shape[:2]
 
-            # ── Original AI tracking layer ────────────────────────────────
+            # ── Sub-system outputs (producers only — no serial, no final logging) ──
             drone_state, drone_cmd, target_ctr = ai_decision(boxes, w_disp, h_disp)
             draw_ai_overlay(display_frame, target_ctr, w_disp, h_disp)
 
-            # ── v3 Navigation / obstacle avoidance layer ──────────────────
             nav_cmd, obstacles, danger_obs = nav_decision(boxes, w_disp, h_disp)
-            draw_nav_overlay(display_frame, nav_cmd, obstacles, danger_obs, w_disp, h_disp)
+
+            # ── MASTER ARBITER — single authority for final command ────────
+            master_cmd, master_owner = master_decision(
+                nav_cmd      = nav_cmd,
+                ai_cmd       = drone_cmd,
+                ai_state     = drone_state,
+                obstacles    = obstacles,
+                stale_frame  = False,   # stale handled above; here frame is fresh
+                reader_alive = _reader_alive.is_set(),
+            )
+
+            draw_nav_overlay(display_frame, master_cmd, obstacles, danger_obs, w_disp, h_disp)
 
             # ── HUD ───────────────────────────────────────────────────────
             display_fps_frames += 1
@@ -2061,6 +2398,8 @@ def main():
                 f"Dr State: {drone_state}",
                 f"AI  Cmd : {drone_cmd}",
                 f"NAV Cmd : {nav_cmd}",
+                f"MASTER  : {master_owner}",
+                f"CMD     : {master_cmd}",
                 f"Depth   : {top_prox}",
                 f"Mem Obs : {mem_count}",
                 f"Low Pwr : {'ON' if _low_power_mode else 'OFF'}",
