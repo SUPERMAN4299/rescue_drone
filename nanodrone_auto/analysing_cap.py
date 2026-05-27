@@ -200,7 +200,7 @@ class DroneConfig:
     human_hover_frac:           float = 0.08
     human_center_overlap_min:   float = 0.40
     emergency_area_frac:        float = 0.68   # v6: was 0.60 — less aggressive ES trigger
-    safe_release_frac:          float = 0.35
+    safe_release_frac:          float = 0.60
 
     # ── Speed tier thresholds ─────────────────────────────────────────────
     speed_clear_frac:           float = 0.04
@@ -248,7 +248,7 @@ class DroneConfig:
     ai_center_thresh:           float = 0.22   # v6: was 0.18 — wider dead-band stops L↔R jitter
 
     # ── Obstacle EMA ──────────────────────────────────────────────────────
-    depth_ema_alpha:            float = 0.25   # v6: was 0.45 — heavier smoothing on proximity
+    depth_ema_alpha:            float = 0.15   # v6: was 0.45 — heavier smoothing on proximity
 
     # ── YOLO / camera ─────────────────────────────────────────────────────
     model:                      str   = "yolov8n.pt"
@@ -259,7 +259,7 @@ class DroneConfig:
     device:                     str   = "cpu"
     cam_w:                      int   = 640
     cam_h:                      int   = 480
-    display_scale:              float = 1.2
+    display_scale:              float = 1.0
     tier:                       str   = "CPU"
 
     # ── Human count throttle ──────────────────────────────────────────────
