@@ -1628,8 +1628,7 @@ HUMAN_CLASS = 0
 # ══════════════════════════════════════════════════════════════════════════════
 
 STREAM_PORT = 8080
-stream_url = f"http://192.168.1.6:{STREAM_PORT}/video"
-
+stream_url = f"http://192.168.1.4:{STREAM_PORT}/video"
 _frame_lock    = threading.Lock()
 _latest_frame: Optional[np.ndarray] = None
 _frame_counter = 0

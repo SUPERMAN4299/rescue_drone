@@ -444,7 +444,7 @@ def _scale_frame_for_display(frame: np.ndarray) -> np.ndarray:
 
 def main():
     # ── Drone serial confirmation ────────────────────────────────────────────
-    router_ip = "http://192.168.1.6:8080"          # ← TEST MODE; replace with get_drone_ip()
+    router_ip = "http://192.168.1.1:8080"          # ← TEST MODE; replace with get_drone_ip()
     print(f"[Serial] Drone IP: {router_ip}  (test mode)")
 
     # ── Start background threads ─────────────────────────────────────────────
