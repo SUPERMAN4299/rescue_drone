@@ -175,6 +175,9 @@ class DroneEventLogger:
 event_log = DroneEventLogger(file_path=None)
 
 
+
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  IMPROVEMENT 3 — CENTRALIZED CONFIG SYSTEM  (v4 preserved + v5 additions)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -283,7 +286,7 @@ class DroneConfig:
 
     # ── IMPROVEMENT 1: Safe-test mode overrides ───────────────────────────
     safe_test_pwm_max:          int   = 120   # max PWM 0-255 in safe-test
-    safe_test_es_frac:          float = 0.35  # tighter emergency threshold
+    safe_test_es_frac:          float = 0.78  # v7: raised from 0.35 — was far too sensitive
     safe_test_search_delay:     float = 2.0   # extra seconds added to search phase
 
     # ── IMPROVEMENT 6: Motor safety limiter ──────────────────────────────
@@ -295,6 +298,16 @@ class DroneConfig:
 
     # ── IMPROVEMENT 7: Stale-command TTL ─────────────────────────────────
     stale_cmd_ttl:              float = 0.5   # discard queued cmds older than this
+
+    # ── v7 EMERGENCY STABILITY FIELDS ─────────────────────────────────────
+    # These six fields replace the single EMERGENCY_AREA_FRAC trigger with a
+    # confirmation buffer + hysteresis + centre-corridor validation system.
+    emergency_confirm_frames:   int   = 6     # consecutive CENTER-danger frames before ES
+    emergency_enter_frac:       float = 0.78  # proximity threshold to START emergency
+    emergency_exit_frac:        float = 0.42  # proximity to END emergency (hysteresis gap)
+    min_obstacle_area_frac:     float = 0.008 # ignore YOLO boxes < 0.8% of frame area
+    max_obstacle_aspect_ratio:  float = 4.0   # ignore very wide/tall boxes (walls/ceilings)
+    proximity_ema_live:         float = 0.30  # EMA alpha for tid=-1 live proximity path
 
     # ─────────────────────────────────────────────────────────────────────
     #  v6 STABILITY FIELDS  (no new subsystems — tuning only)
@@ -314,6 +327,34 @@ class DroneConfig:
 
     # Fix 8: frames of nav CAUTION/CLEAR before AI can override with forward motion
     nav_override_guard:         int   = 3     # nav must be stable before AI forward allowed
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  v8 REAL-WORLD ROBUSTNESS FIELDS
+    # ─────────────────────────────────────────────────────────────────────
+    # IMPROVEMENT 1: bbox stability — max IoU-frame-delta before box is
+    # considered "flickering".  0.0 = perfectly still; 1.0 = fully replaced.
+    bbox_stability_jitter_thresh:  float = 0.55   # displacement fraction of box size
+    bbox_stability_history:        int   = 5      # frames kept per tracked box
+    # IMPROVEMENT 2: approach velocity — minimum fractional area growth per
+    # second to count as "genuinely approaching".
+    approach_min_growth_rate:      float = 0.04   # 4% area growth/s = real approach
+    # IMPROVEMENT 3: confidence weighting — low-confidence detections get
+    # their proximity score scaled down.
+    conf_weight_floor:             float = 0.40   # conf below this → full penalty
+    conf_weight_ceil:              float = 0.70   # conf above this → no penalty
+    # IMPROVEMENT 4: motion-blur guard — if the single-frame bbox area jumps
+    # by more than this fraction, treat as a blur spike and suppress ES.
+    blur_area_explosion_thresh:    float = 2.5    # 2.5× area expansion in one frame
+    blur_suppression_decay:        float = 0.25   # suppression decays by this per frame
+    # IMPROVEMENT 6: danger confidence accumulator — slow build / slow decay
+    danger_conf_build_rate:        float = 0.18   # added per frame when dangerous
+    danger_conf_decay_rate:        float = 0.08   # subtracted per frame when not
+    danger_conf_threshold:         float = 0.72   # must reach this to trigger ES
+    # IMPROVEMENT 7: camera-shake — optical-flow magnitude above this (px/frame)
+    # enables shake-suppression mode; magnitude below exits it.
+    shake_flow_enter:              float = 14.0   # px/frame → suppression on
+    shake_flow_exit:               float = 6.0    # px/frame → suppression off
+    shake_suppression_factor:      float = 0.55   # multiply ES proximity weight
 
     # ─────────────────────────────────────────────────────────────────────
     #  Hardware profiles (unchanged)
@@ -382,6 +423,7 @@ class MotionPrimitive(Enum):
     SCAN_FORWARD   = "MOVE_SCAN_FORWARD"
     SAFE_SEARCH    = "MOVE_SAFE_SEARCH"
     EMERGENCY_STOP = "MOVE_EMERGENCY_STOP"
+    BACKOFF        = "MOVE_BACKOFF"          # collision-emergency reverse thrust
 
 
 MOTION_TOKENS: Dict[MotionPrimitive, str] = {
@@ -398,6 +440,7 @@ MOTION_TOKENS: Dict[MotionPrimitive, str] = {
     MotionPrimitive.SCAN_FORWARD   : "FS",
     MotionPrimitive.SAFE_SEARCH    : "SS",
     MotionPrimitive.EMERGENCY_STOP : "ES",
+    MotionPrimitive.BACKOFF        : "E",    # collision-emergency token
 }
 
 
@@ -474,6 +517,7 @@ MOVE_SEARCH_RIGHT   = MotionPrimitive.SEARCH_RIGHT.value
 MOVE_SCAN_FORWARD   = MotionPrimitive.SCAN_FORWARD.value
 MOVE_SAFE_SEARCH    = MotionPrimitive.SAFE_SEARCH.value
 MOVE_EMERGENCY_STOP = MotionPrimitive.EMERGENCY_STOP.value
+MOVE_BACKOFF        = MotionPrimitive.BACKOFF.value   # collision-emergency backoff
 
 NAV_FAST_FORWARD   = "FAST_FORWARD"
 NAV_SLOW_FORWARD   = "SLOW_FORWARD"
@@ -510,6 +554,7 @@ ARDUINO_TOKENS: Dict[str, str] = {
     MOVE_HOVER: "H", MOVE_STOP: "ST", MOVE_SEARCH_LEFT: "SL",
     MOVE_SEARCH_RIGHT: "SR", MOVE_SCAN_FORWARD: "FS",
     MOVE_SAFE_SEARCH: "SS", MOVE_EMERGENCY_STOP: "ES",
+    MOVE_BACKOFF: "E",   # collision-emergency token
 }
 
 ARDUINO_TOKENS_V3: Dict[str, str] = {
@@ -1106,6 +1151,30 @@ _FORWARD_STABILITY_MIN    = cfg.forward_stability_min
 _OBS_SMOOTH_ALPHA         = cfg.obs_smooth_alpha
 _NAV_OVERRIDE_GUARD       = cfg.nav_override_guard
 
+# ── v7 emergency stability constants ─────────────────────────────────────────
+# These replace the single EMERGENCY_AREA_FRAC trigger with a confirmation
+# buffer + hysteresis system. See _check_emergency() for full details.
+_EMERGENCY_CONFIRM_FRAMES = cfg.emergency_confirm_frames   # 6 consecutive frames
+_EMERGENCY_ENTER_FRAC     = cfg.emergency_enter_frac       # 0.78 — enter ES
+_EMERGENCY_EXIT_FRAC      = cfg.emergency_exit_frac        # 0.42 — exit ES (hysteresis)
+_MIN_OBS_AREA_FRAC        = cfg.min_obstacle_area_frac     # 0.008 — blob size gate
+_MAX_OBS_ASPECT           = cfg.max_obstacle_aspect_ratio  # 4.0  — flat surface gate
+_LIVE_PROX_EMA_ALPHA      = cfg.proximity_ema_live         # 0.30 — tid=-1 smoothing
+# ── v8 robustness constants ───────────────────────────────────────────────────
+_BBOX_STAB_JITTER     = cfg.bbox_stability_jitter_thresh
+_BBOX_STAB_HISTORY    = cfg.bbox_stability_history
+_APPROACH_MIN_GROWTH  = cfg.approach_min_growth_rate
+_CONF_WEIGHT_FLOOR    = cfg.conf_weight_floor
+_CONF_WEIGHT_CEIL     = cfg.conf_weight_ceil
+_BLUR_EXPLOSION_THRESH= cfg.blur_area_explosion_thresh
+_BLUR_SUPPRESSION_DEC = cfg.blur_suppression_decay
+_DANGER_CONF_BUILD    = cfg.danger_conf_build_rate
+_DANGER_CONF_DECAY    = cfg.danger_conf_decay_rate
+_DANGER_CONF_THRESH   = cfg.danger_conf_threshold
+_SHAKE_FLOW_ENTER     = cfg.shake_flow_enter
+_SHAKE_FLOW_EXIT      = cfg.shake_flow_exit
+_SHAKE_SUPPRESSION    = cfg.shake_suppression_factor
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  TORCH CPU THREAD TUNING (unchanged)
@@ -1150,32 +1219,565 @@ def _write_human_count(count: int) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 _depth_ema: Dict[int, float] = {}
+# v7: EMA for the untracked (tid=-1) live proximity path used by _check_emergency
+_live_prox_ema: Dict[int, float] = {}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  v8 REAL-WORLD ROBUSTNESS LAYER
+#  All classes are read-only to the rest of the stack — they produce scalar
+#  multipliers (0.0–1.0) that weight down proximity scores without removing
+#  any existing validation system.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── IMPROVEMENT 1: BBox Stability Tracker ────────────────────────────────────
+
+class BBoxStabilityTracker:
+    """
+    Tracks per-object bounding-box position history and returns a
+    stability score in [0, 1].
+
+    score = 1.0  → box has been geometrically consistent across history
+    score → 0.0  → box is jumping around (motion-blur / flicker)
+
+    The score is computed as:
+        1 − clamp(mean_displacement / box_size, 0, 1)
+    where displacement is the centre-point movement between successive
+    frames normalised by the diagonal of the bounding box.
+
+    Usage:  bbox_stability.update(tid, box)  → float stability score
+    """
+
+    def __init__(self, history_len: int = 5, jitter_thresh: float = 0.55):
+        self._history:  Dict[int, deque]  = {}
+        self._scores:   Dict[int, float]  = {}
+        self._history_len  = history_len
+        self._jitter_thresh = jitter_thresh
+
+    def update(self, tid: int, box: Tuple[int, int, int, int]) -> float:
+        """
+        Record box for `tid` and return current stability score [0, 1].
+        tid=-1 (untracked) always returns 1.0 — we can't assess stability
+        without identity continuity.
+        """
+        if tid < 0:
+            return 1.0
+
+        x1, y1, x2, y2 = box
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        diag = math.hypot(max(1, x2 - x1), max(1, y2 - y1))
+
+        hist = self._history.setdefault(tid, deque(maxlen=self._history_len))
+        hist.append((cx, cy, diag))
+
+        if len(hist) < 2:
+            self._scores[tid] = 1.0
+            return 1.0
+
+        displacements = []
+        prev_cx, prev_cy, prev_diag = hist[0]
+        for (hcx, hcy, hd) in list(hist)[1:]:
+            d = math.hypot(hcx - prev_cx, hcy - prev_cy)
+            displacements.append(d / max(1.0, hd))
+            prev_cx, prev_cy, prev_diag = hcx, hcy, hd
+
+        mean_disp = sum(displacements) / len(displacements)
+        # Smooth score with a gentle EMA so brief jitter doesn't immediately
+        # tank the score (gives the tracker time to settle after a real move).
+        raw_score = float(np.clip(1.0 - mean_disp / max(self._jitter_thresh, 0.01),
+                                  0.0, 1.0))
+        prev_score = self._scores.get(tid, raw_score)
+        score = 0.35 * raw_score + 0.65 * prev_score
+        self._scores[tid] = score
+        return score
+
+    def score(self, tid: int) -> float:
+        """Return last computed stability score without updating."""
+        if tid < 0:
+            return 1.0
+        return self._scores.get(tid, 1.0)
+
+    def evict_stale(self, active_tids: set) -> None:
+        """Remove history for objects no longer tracked."""
+        for tid in list(self._history.keys()):
+            if tid not in active_tids:
+                self._history.pop(tid, None)
+                self._scores.pop(tid, None)
+
+
+bbox_stability = BBoxStabilityTracker(
+    history_len=_BBOX_STAB_HISTORY,
+    jitter_thresh=_BBOX_STAB_JITTER,
+)
+
+
+# ── IMPROVEMENT 2: Approach Velocity Tracker ─────────────────────────────────
+
+class ApproachVelocityTracker:
+    """
+    Estimates whether a tracked object is genuinely approaching the camera
+    by measuring fractional bounding-box area growth over time.
+
+    approach_velocity > _APPROACH_MIN_GROWTH  → object is closing in
+    approach_velocity ≤ 0                     → object is stationary or receding
+
+    Returns a weight in [0, 1]:
+        1.0 when the object is clearly approaching at or above threshold.
+        0.0 when area is shrinking.
+        Linearly interpolated between the two.
+    """
+
+    def __init__(self, min_growth_rate: float = 0.04):
+        self._areas:      Dict[int, Tuple[float, float]] = {}  # tid → (area, timestamp)
+        self._velocities: Dict[int, float]               = {}
+        self._min_growth  = min_growth_rate
+
+    def update(self, tid: int, box: Tuple[int, int, int, int],
+               frame_area: int) -> float:
+        """
+        Record normalised box area for `tid` and return an approach weight [0, 1].
+        tid=-1 returns 0.5 (neutral — no history to assess direction).
+        """
+        if tid < 0:
+            return 0.5   # untracked — assume neutral; do not reward or penalise
+
+        x1, y1, x2, y2 = box
+        now = time.time()
+        norm_area = ((x2 - x1) * (y2 - y1)) / max(1, frame_area)
+
+        if tid in self._areas:
+            prev_area, prev_t = self._areas[tid]
+            dt = max(now - prev_t, 1e-3)
+            # Fractional growth rate per second
+            vel = (norm_area - prev_area) / (prev_area * dt + 1e-6)
+            # EMA on velocity to smooth noisy growth estimates
+            prev_vel = self._velocities.get(tid, vel)
+            vel = 0.30 * vel + 0.70 * prev_vel
+            self._velocities[tid] = vel
+        else:
+            vel = 0.0
+            self._velocities[tid] = 0.0
+
+        self._areas[tid] = (norm_area, now)
+
+        if vel >= self._min_growth:
+            # Approaching — scale from 0.5 at floor to 1.0 at 3× floor
+            weight = float(np.clip(
+                0.5 + 0.5 * (vel - self._min_growth) / (2 * self._min_growth + 1e-6),
+                0.5, 1.0,
+            ))
+        else:
+            # Stationary or receding — scale from 0.5 down to 0.0
+            weight = float(np.clip(0.5 + vel / (self._min_growth + 1e-6) * 0.5,
+                                   0.0, 0.5))
+
+        return weight
+
+    def velocity(self, tid: int) -> float:
+        """Return last estimated approach velocity (fractional area / s)."""
+        return self._velocities.get(tid, 0.0)
+
+    def evict_stale(self, active_tids: set, timeout: float = 1.0) -> None:
+        now = time.time()
+        for tid in list(self._areas.keys()):
+            if tid not in active_tids or now - self._areas[tid][1] > timeout:
+                self._areas.pop(tid, None)
+                self._velocities.pop(tid, None)
+
+
+approach_tracker = ApproachVelocityTracker(min_growth_rate=_APPROACH_MIN_GROWTH)
+
+
+# ── IMPROVEMENT 4: Motion-Blur Guard ─────────────────────────────────────────
+
+class MotionBlurGuard:
+    """
+    Detects sudden single-frame bounding-box area explosions that are
+    characteristic of motion blur, rapid camera shake, or YOLO hallucination
+    on low-texture / low-light frames.
+
+    When an explosion is detected the guard raises a suppression flag.
+    The suppression factor decays back to 1.0 over subsequent frames.
+
+    suppression_factor() returns a value in (0, 1]:
+        1.0  → no suppression
+        →0.0 → maximum suppression (proximity scores multiplied down)
+    """
+
+    def __init__(self, explosion_thresh: float = 2.5, decay: float = 0.25):
+        self._prev_areas:   Dict[int, float] = {}
+        self._suppression:  float = 1.0        # current global suppression factor
+        self._explosion_thresh = explosion_thresh
+        self._decay        = decay
+
+    def update(self, boxes: list, frame_area: int) -> None:
+        """
+        Call once per YOLO result set.  Checks each box for an area explosion
+        relative to the previous frame for the same track id.
+        """
+        current_areas: Dict[int, float] = {}
+        explosion_detected = False
+
+        for (x1, y1, x2, y2, conf, tid, cls_id) in boxes:
+            area = max(0, (x2 - x1) * (y2 - y1)) / max(1, frame_area)
+            if tid >= 0:
+                current_areas[tid] = area
+                prev = self._prev_areas.get(tid, area)
+                if prev > 0 and area / max(prev, 1e-6) > self._explosion_thresh:
+                    explosion_detected = True
+                    event_log.log(
+                        "WATCHDOG",
+                        f"Blur guard: tid={tid} area explosion "
+                        f"{prev * 100:.1f}% → {area * 100:.1f}%",
+                    )
+
+        self._prev_areas = current_areas
+
+        if explosion_detected:
+            # Drop suppression immediately
+            self._suppression = max(0.15, self._suppression - 0.60)
+        else:
+            # Recover gradually
+            self._suppression = min(1.0, self._suppression + self._decay)
+
+    def suppression_factor(self) -> float:
+        """Multiply emergency proximity scores by this value [0, 1]."""
+        return self._suppression
+
+    @property
+    def is_suppressed(self) -> bool:
+        return self._suppression < 0.90
+
+
+blur_guard = MotionBlurGuard(
+    explosion_thresh=_BLUR_EXPLOSION_THRESH,
+    decay=_BLUR_SUPPRESSION_DEC,
+)
+
+
+# ── IMPROVEMENT 6: Danger Confidence Accumulator ─────────────────────────────
+
+class DangerConfidenceAccumulator:
+    """
+    Slow-build / slow-decay confidence score for emergency transitions.
+
+    Instead of counting raw confirmation frames (which can reset on a
+    single missed frame via the v7 soft-decay), this accumulator integrates
+    evidence over time like a leaky bucket:
+
+        on danger frame  : confidence += build_rate   (capped at 1.0)
+        on safe frame    : confidence -= decay_rate   (floored at 0.0)
+
+    `ready` returns True when confidence ≥ threshold.
+
+    This works **in addition to** the existing _emergency_confirm_count
+    logic — both gates must pass before ES fires (AND condition in
+    _check_emergency).
+    """
+
+    def __init__(self, build_rate: float = 0.18, decay_rate: float = 0.08,
+                 threshold: float = 0.72):
+        self.confidence  = 0.0
+        self._build      = build_rate
+        self._decay      = decay_rate
+        self._threshold  = threshold
+
+    def update_danger(self, is_dangerous: bool) -> None:
+        if is_dangerous:
+            self.confidence = min(1.0, self.confidence + self._build)
+        else:
+            self.confidence = max(0.0, self.confidence - self._decay)
+
+    @property
+    def ready(self) -> bool:
+        return self.confidence >= self._threshold
+
+    def reset(self) -> None:
+        self.confidence = 0.0
+
+
+danger_confidence = DangerConfidenceAccumulator(
+    build_rate=_DANGER_CONF_BUILD,
+    decay_rate=_DANGER_CONF_DECAY,
+    threshold=_DANGER_CONF_THRESH,
+)
+
+
+# ── IMPROVEMENT 7: Camera-Shake Detector ─────────────────────────────────────
+
+class CameraShakeDetector:
+    """
+    Estimates global camera motion using sparse optical flow (Lucas-Kanade)
+    on a downscaled greyscale frame pair.
+
+    When the mean flow magnitude exceeds `shake_flow_enter` the detector
+    reports shake; it exits when magnitude drops below `shake_flow_exit`.
+
+    ── COLLISION EMERGENCY ESCALATION (new) ────────────────────────────────
+    If optical flow stays above `shake_flow_enter` for `collision_confirm_frames`
+    consecutive frames (default 4), the detector declares a COLLISION EMERGENCY:
+
+        check_collision_emergency() → True
+
+    The collision emergency stays active for at least `collision_hold_sec` seconds
+    (default 1.5) even if flow drops immediately (hysteresis / cooldown).
+    After the hold expires the emergency clears only when flow stays below
+    `shake_flow_exit` — preventing rapid ENTER/EXIT spam.
+
+    The collision emergency is independent of YOLO / human detection.  It fires
+    on raw optical-flow evidence alone so that wall / hand impacts are caught
+    even when no objects are tracked.
+
+    On hardware without OpenCV's optical flow (e.g. headless CPU) the
+    detector gracefully degrades — suppression_factor=1.0, no collision alarm.
+    """
+
+    # ── Collision escalation defaults ─────────────────────────────────────
+    _COLLISION_CONFIRM_FRAMES: int   = 4    # consecutive high-flow frames needed
+    _COLLISION_HOLD_SEC:       float = 1.5  # minimum active duration (hysteresis)
+
+    def __init__(self, enter: float = 14.0, exit_: float = 6.0,
+                 suppression: float = 0.55):
+        self._enter       = enter
+        self._exit        = exit_
+        self._supp_val    = suppression
+        self._shaking     = False
+        self._prev_grey: Optional[np.ndarray] = None
+        self._mean_flow   = 0.0
+        self._lk_params   = dict(winSize=(15,15), maxLevel=2,
+                                  criteria=(cv2.TERM_CRITERIA_EPS |
+                                            cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+        self._feature_params = dict(maxCorners=40, qualityLevel=0.3,
+                                     minDistance=10, blockSize=7)
+
+        # ── Collision escalation state ─────────────────────────────────────
+        self._collision_consec:   int   = 0      # consecutive high-flow frames
+        self._collision_active:   bool  = False  # True while hold is in effect
+        self._collision_start_t:  float = 0.0   # wall-clock when collision confirmed
+        self._collision_hold_sec: float = self._COLLISION_HOLD_SEC
+
+    def update(self, frame: np.ndarray) -> None:
+        """
+        Call once per display frame.  Internally downscales to 160×120 for
+        speed.  Updates self._shaking, self._mean_flow, and collision state.
+        """
+        try:
+            small = cv2.resize(frame, (160, 120), interpolation=cv2.INTER_NEAREST)
+            grey  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+            if self._prev_grey is None:
+                self._prev_grey = grey
+                return
+
+            pts = cv2.goodFeaturesToTrack(self._prev_grey, **self._feature_params)
+            if pts is None or len(pts) < 4:
+                self._prev_grey = grey
+                self._advance_collision_state(high_flow=False)
+                return
+
+            next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+                self._prev_grey, grey, pts, None, **self._lk_params)
+
+            good_old = pts[status == 1]
+            good_new = next_pts[status == 1]
+
+            if len(good_old) < 4:
+                self._prev_grey = grey
+                self._advance_collision_state(high_flow=False)
+                return
+
+            flow = good_new - good_old
+            magnitudes = np.linalg.norm(flow, axis=1)
+            # Scale back to original resolution
+            scale = frame.shape[1] / 160.0
+            self._mean_flow = float(np.median(magnitudes) * scale)
+
+            # ── Shake enter/exit (unchanged) ──────────────────────────────
+            if self._shaking:
+                if self._mean_flow < self._exit:
+                    self._shaking = False
+                    event_log.log("WATCHDOG",
+                                  f"Shake detector: EXIT (flow={self._mean_flow:.1f}px)")
+            else:
+                if self._mean_flow > self._enter:
+                    self._shaking = True
+                    event_log.log("WATCHDOG",
+                                  f"Shake detector: ENTER (flow={self._mean_flow:.1f}px)")
+
+            # ── Collision escalation counter ──────────────────────────────
+            self._advance_collision_state(high_flow=self._mean_flow > self._enter)
+
+            self._prev_grey = grey
+
+        except Exception:
+            # Optical flow failure (e.g. greyscale conversion error) — silently skip
+            pass
+
+    # ── Internal collision state machine ──────────────────────────────────
+
+    def _advance_collision_state(self, high_flow: bool) -> None:
+        """
+        Called every frame with whether flow is currently high.
+        Manages the consecutive-frame counter and the timed hold.
+        """
+        now = time.time()
+
+        if self._collision_active:
+            # Already in collision emergency — check if hold has expired
+            held = now - self._collision_start_t
+            if held >= self._collision_hold_sec and not high_flow:
+                # Hold expired and flow is calm — clear the emergency
+                self._collision_active   = False
+                self._collision_consec   = 0
+                event_log.log("WATCHDOG",
+                              f"Collision emergency CLEARED "
+                              f"(held {held:.1f}s, flow={self._mean_flow:.1f}px)")
+            # else: keep active (hold still running or flow still high)
+        else:
+            if high_flow:
+                self._collision_consec += 1
+                if self._collision_consec >= self._COLLISION_CONFIRM_FRAMES:
+                    # Confirmed collision — enter emergency
+                    self._collision_active  = True
+                    self._collision_start_t = now
+                    self._collision_consec  = 0
+                    event_log.log("WATCHDOG",
+                                  f"Emergency collision triggered — "
+                                  f"flow={self._mean_flow:.1f}px sustained "
+                                  f"{self._COLLISION_CONFIRM_FRAMES} frames")
+            else:
+                # Flow fell below threshold — reset counter (no false alarm)
+                self._collision_consec = max(0, self._collision_consec - 1)
+
+    # ── Public API ────────────────────────────────────────────────────────
+
+    def check_collision_emergency(self) -> bool:
+        """
+        Returns True when a sustained high-flow collision has been confirmed
+        and the hold period is still active.  Independent of YOLO tracking.
+        """
+        return self._collision_active
+
+    @property
+    def collision_consec_frames(self) -> int:
+        """Current consecutive high-flow frame count (for HUD debug)."""
+        return self._collision_consec
+
+    @property
+    def collision_active_elapsed(self) -> float:
+        """Seconds since the collision emergency started (0 if inactive)."""
+        if not self._collision_active:
+            return 0.0
+        return time.time() - self._collision_start_t
+
+    @property
+    def is_shaking(self) -> bool:
+        return self._shaking
+
+    @property
+    def mean_flow(self) -> float:
+        return self._mean_flow
+
+    def suppression_factor(self) -> float:
+        """Returns _supp_val when shaking, 1.0 otherwise."""
+        return self._supp_val if self._shaking else 1.0
+
+
+camera_shake = CameraShakeDetector(
+    enter=_SHAKE_FLOW_ENTER,
+    exit_=_SHAKE_FLOW_EXIT,
+    suppression=_SHAKE_SUPPRESSION,
+)
 
 
 def estimate_pseudo_depth_v3(x1, y1, x2, y2, frame_w, frame_h, tid=-1) -> float:
+    """
+    Pseudo-depth estimator — v7 rewrite.
+
+    v7 changes (architecture and ToF hook preserved verbatim):
+    ─────────────────────────────────────────────────────────
+    FIX-8a  Minimum size gate: boxes < _MIN_OBS_AREA_FRAC of frame area
+            return 0.0 immediately — noisy texture blobs eliminated.
+    FIX-4c  Aspect-ratio penalty: boxes with w:h > _MAX_OBS_ASPECT or
+            < 1/_MAX_OBS_ASPECT (flat floor/ceiling, thin wall column) lose
+            up to 55% of their proximity weight via a smooth curve.
+    FIX-4a  Area weight reduced 0.55 → 0.35 so large distant surfaces no
+            longer dominate the raw score.
+    FIX-4b  Centre-distance factor: an obstacle at the horizontal frame edge
+            (cx ≈ 0 or frame_w) gets 60% weight reduction — side walls can
+            no longer masquerade as frontal threats.
+    FIX-6   EMA applied on the tid=-1 live path too (via _live_prox_ema keyed
+            on bbox hash) so single-frame spikes reaching _check_emergency are
+            pre-smoothed before the confirmation buffer sees them.
+    """
     if frame_w <= 0 or frame_h <= 0:
         return 0.0
-    bw, bh     = max(0, x2-x1), max(0, y2-y1)
-    area_cue   = min(1.0, (bw * bh) / (frame_w * frame_h))
+
+    bw, bh = max(0, x2 - x1), max(0, y2 - y1)
+
+    # ── FIX-8a: minimum size gate ─────────────────────────────────────────
+    raw_area_frac = (bw * bh) / max(1, frame_w * frame_h)
+    if raw_area_frac < _MIN_OBS_AREA_FRAC:
+        return 0.0   # blob too small — not a real collision threat
+
+    # ── FIX-4c: aspect-ratio penalty ──────────────────────────────────────
+    aspect = bw / max(1, bh)                              # width : height ratio
+    if aspect > _MAX_OBS_ASPECT or aspect < (1.0 / _MAX_OBS_ASPECT):
+        # Extreme flat (floor/ceiling) or thin (wall column) detection
+        aspect_penalty = 0.45
+    else:
+        # Smooth penalty curve: 1.0 at square, decreasing toward limits
+        excess = max(aspect / _MAX_OBS_ASPECT,
+                     (_MAX_OBS_ASPECT / max(aspect, 1e-6)) ** -1)
+        aspect_penalty = float(np.clip(1.0 - 0.3 * (excess - 1.0), 0.45, 1.0))
+
+    # ── Spatial cues ──────────────────────────────────────────────────────
+    area_cue   = min(1.0, raw_area_frac)
     width_cue  = min(1.0, bw / frame_w)
     height_cue = min(1.0, bh / frame_h)
     cy_norm    = ((y1 + y2) / 2.0) / frame_h
+    cx_norm    = ((x1 + x2) / 2.0) / frame_w
     vpos_cue   = float(np.clip(cy_norm, 0.0, 1.0))
+
+    # ── FIX-4b: centre-distance weighting ─────────────────────────────────
+    # Obstacle dead-centre (cx_norm=0.5) = full weight.
+    # At frame edge (cx_norm=0 or 1) = 40% weight — side walls ignored.
+    centre_dist   = abs(cx_norm - 0.5)
+    centre_factor = float(np.clip(1.0 - centre_dist * 1.2, 0.40, 1.0))
+
     # HARDWARE-READY COMMENT: ToF / ultrasonic proximity blend
     # Uncomment and implement once hardware is connected:
     # zone = classify_horizontal_zone((x1+x2)//2, frame_w)
     # sensor_prox = sensor_fusion.get_proximity(zone)
     # if sensor_prox is not None: raw = 0.6*raw + 0.4*sensor_prox
+
+    # ── FIX-4a: lower area dominance, apply spatial modifiers ────────────
+    # Old: 0.55*area + 0.20*width + 0.15*height + 0.10*vpos
+    # New: area weight reduced, centre + aspect corrections applied
     raw = float(np.clip(
-        0.55*area_cue + 0.20*width_cue + 0.15*height_cue + 0.10*vpos_cue,
-        0.0, 1.0
+        (0.35 * area_cue + 0.28 * width_cue + 0.22 * height_cue + 0.15 * vpos_cue)
+        * centre_factor
+        * aspect_penalty,
+        0.0, 1.0,
     ))
+
+    # ── FIX-6: EMA on BOTH tracked and live paths ─────────────────────────
     if tid >= 0:
+        # Original tracked-object EMA (unchanged)
         prev     = _depth_ema.get(tid, raw)
         smoothed = _DEPTH_EMA_ALPHA * raw + (1.0 - _DEPTH_EMA_ALPHA) * prev
         _depth_ema[tid] = smoothed
         return smoothed
-    return raw
+    else:
+        # v7: smooth the live/untracked path used by _check_emergency
+        bbox_key = hash((x1, y1, x2, y2)) & 0xFFFFFFFF
+        prev     = _live_prox_ema.get(bbox_key, raw)
+        smoothed = _LIVE_PROX_EMA_ALPHA * raw + (1.0 - _LIVE_PROX_EMA_ALPHA) * prev
+        if len(_live_prox_ema) > 150:   # evict oldest entries to bound memory
+            for _k in list(_live_prox_ema.keys())[:50]:
+                _live_prox_ema.pop(_k, None)
+        _live_prox_ema[bbox_key] = smoothed
+        return smoothed
 
 
 def classify_horizontal_zone(cx: int, frame_w: int) -> str:
@@ -1242,13 +1844,72 @@ def _update_obstacle_memory(live: List[ObstacleInfo]) -> List[ObstacleInfo]:
 
 
 def _compute_live_obstacles(boxes: list, frame_w: int, frame_h: int) -> List[ObstacleInfo]:
-    now  = time.time()
-    live = []
+    """
+    v8 additions (architecture unchanged):
+
+    IMPROVEMENT 3 — confidence weighting
+        Low-YOLO-confidence detections have their proximity scaled down
+        via a linear ramp between conf_weight_floor and conf_weight_ceil.
+
+    IMPROVEMENT 5 — forward-corridor priority
+        Objects near the lateral frame edges (cx close to 0 or frame_w)
+        get an additional proximity weight reduction.  Only objects
+        overlapping the flight corridor receive full weight.
+
+    IMPROVEMENT 1 — stability score applied here
+        bbox_stability.update() is called; the returned score multiplies
+        the final proximity.  Flickering boxes lose weight automatically.
+
+    IMPROVEMENT 2 — approach velocity called here
+        approach_tracker.update() is called but its weight is NOT applied
+        to _compute_live_obstacles — this path feeds _check_emergency
+        directly, so we want unmodified proximity values.  The tracker
+        merely accumulates history so _check_emergency can query it.
+    """
+    now        = time.time()
+    frame_area = max(1, frame_w * frame_h)
+    live       = []
+
     for (x1, y1, x2, y2, conf, tid, cls_id) in boxes:
         if cls_id not in NAVIGATION_CLASSES:
             continue
+
+        # ── IMPROVEMENT 3: confidence weight ─────────────────────────────
+        # Scale proximity down for low-confidence detections.
+        # Detections above conf_weight_ceil are unaffected (weight=1.0).
+        conf_weight = float(np.clip(
+            (conf - _CONF_WEIGHT_FLOOR) / max(_CONF_WEIGHT_CEIL - _CONF_WEIGHT_FLOOR, 1e-4),
+            0.20,   # floor: even very low-conf detections keep 20% weight
+            1.0,
+        ))
+
         cx, cy    = (x1+x2)//2, (y1+y2)//2
         proximity = estimate_pseudo_depth_v3(x1, y1, x2, y2, frame_w, frame_h, tid=-1)
+
+        # ── IMPROVEMENT 5: flight-corridor priority ────────────────────────
+        # Objects at the lateral edges of the frame (side walls, door frames)
+        # receive a reduced weight because they are NOT in the flight path.
+        # The existing centre-distance factor inside estimate_pseudo_depth_v3
+        # already accounts for this geometrically; here we add a second soft
+        # gate to further suppress clearly off-axis detections.
+        cx_norm        = cx / max(1, frame_w)
+        lateral_offset = abs(cx_norm - 0.5)          # 0 = centre, 0.5 = edge
+        # Objects more than 40% off-centre get up to 30% additional penalty
+        corridor_weight = float(np.clip(
+            1.0 - max(0.0, lateral_offset - 0.25) * 1.20,
+            0.70, 1.0,
+        ))
+
+        # ── IMPROVEMENT 1: bbox stability weight ──────────────────────────
+        stability_score = bbox_stability.update(tid, (x1, y1, x2, y2))
+
+        # ── IMPROVEMENT 2: approach velocity history ──────────────────────
+        # We call update here purely to keep the tracker's history current.
+        approach_tracker.update(tid, (x1, y1, x2, y2), frame_area)
+
+        # Apply all v8 weights to this path's proximity
+        proximity = proximity * conf_weight * corridor_weight * stability_score
+
         live.append(ObstacleInfo(
             box=(x1, y1, x2, y2), proximity=proximity,
             zone=classify_horizontal_zone(cx, frame_w),
@@ -1259,19 +1920,48 @@ def _compute_live_obstacles(boxes: list, frame_w: int, frame_h: int) -> List[Obs
 
 
 def analyse_obstacles(boxes: list, frame_w: int, frame_h: int) -> List[ObstacleInfo]:
+    """
+    v7 addition: two pre-filters applied before proximity estimation.
+
+    FIX-8b  Boxes smaller than _MIN_OBS_AREA_FRAC are skipped entirely —
+            they never enter obstacle memory and cannot trigger navigation
+            or emergency decisions.
+    FIX-8c  Boxes with an extreme aspect ratio (> _MAX_OBS_ASPECT × 1.5 or
+            < its reciprocal) are also skipped.  Detections this flat or thin
+            are overwhelmingly walls, floors, or ceiling reflections — not
+            navigable objects in the forward flight corridor.
+
+    Everything else (memory merge, EMA proximity, sort) is identical to v6.
+    """
     now  = time.time()
     live = []
     for (x1, y1, x2, y2, conf, tid, cls_id) in boxes:
         if cls_id not in NAVIGATION_CLASSES:
             continue
-        cx, cy    = (x1+x2)//2, (y1+y2)//2
+
+        # ── FIX-8b: minimum size gate ─────────────────────────────────────
+        bw = max(0, x2 - x1)
+        bh = max(0, y2 - y1)
+        if (bw * bh) / max(1, frame_w * frame_h) < _MIN_OBS_AREA_FRAC:
+            continue   # blob too small — skip entirely
+
+        # ── FIX-8c: extreme aspect ratio gate ────────────────────────────
+        # Very wide (floor/ceiling) and razor-thin (wall column) detections
+        # are pre-rejected before they reach estimate_pseudo_depth_v3.
+        aspect = bw / max(1, bh)
+        if aspect > (_MAX_OBS_ASPECT * 1.5) or aspect < (1.0 / (_MAX_OBS_ASPECT * 1.5)):
+            continue   # extreme flat/thin surface — not a navigable obstacle
+
+        cx, cy    = (x1 + x2) // 2, (y1 + y2) // 2
         proximity = estimate_pseudo_depth_v3(x1, y1, x2, y2, frame_w, frame_h, tid)
+
         live.append(ObstacleInfo(
             box=(x1, y1, x2, y2), proximity=proximity,
             zone=classify_horizontal_zone(cx, frame_w),
             v_zone=classify_vertical_zone(cy, frame_h),
             is_human=(cls_id == HUMAN_CLASS), tid=tid, cls_id=cls_id, timestamp=now,
         ))
+
     live.sort(key=lambda o: o.proximity, reverse=True)
     return _update_obstacle_memory(live)
 
@@ -1463,10 +2153,11 @@ _oscillation_timestamps: deque = deque()
 _EMERG_IDLE     = "IDLE"
 _EMERG_ACTIVE   = "ACTIVE"
 _EMERG_RECOVERY = "RECOVERY"
-_emergency_phase:      str   = _EMERG_IDLE
-_emergency_start_time: float = 0.0
-_emergency_reason:     str   = ""
-_emergency_last_sent:  float = 0.0
+_emergency_phase:         str   = _EMERG_IDLE
+_emergency_start_time:   float = 0.0
+_emergency_reason:       str   = ""
+_emergency_last_sent:    float = 0.0
+_emergency_confirm_count: int  = 0   # v7: consecutive dangerous CENTER frames
 
 
 def _is_dangerous_oscillation(cmd_a: str, cmd_b: str) -> bool:
@@ -1475,39 +2166,139 @@ def _is_dangerous_oscillation(cmd_a: str, cmd_b: str) -> bool:
 
 def _check_emergency(raw_cmd: str, prev_raw: str,
                      live_obstacles: List[ObstacleInfo]) -> bool:
+    """
+    Emergency Safety Layer — v8 rewrite of IDLE phase only.
+    ACTIVE and RECOVERY phases are preserved verbatim from v7.
+
+    v8 IDLE-phase additions (all existing v7 fixes retained):
+    ──────────────────────────────────────────────────────────
+    IMPROVEMENT 4 — blur guard multiplier
+        blur_guard.suppression_factor() scales every obstacle's effective
+        proximity before the threshold comparison.  If the camera just saw
+        a bbox explosion (blur / shake artefact), suppression drops toward
+        0.15 so single-frame YOLO hallucinations cannot fill the
+        confirmation buffer.
+
+    IMPROVEMENT 6 — danger confidence gate (second AND condition)
+        danger_confidence must also be ≥ threshold before ES fires.
+        It builds slowly (build_rate per frame) and decays slowly so
+        brief dangerous frames are absorbed without triggering ES.
+
+    IMPROVEMENT 7 — camera-shake suppression
+        camera_shake.suppression_factor() further attenuates proximity
+        when global frame motion is detected.  This handles hand-held
+        webcam testing and physical vibration on the real drone.
+
+    IMPROVEMENT 2 — approach velocity gate
+        For each candidate CENTER obstacle we check approach_tracker;
+        objects that are NOT growing in area (stationary wall, ceiling)
+        have their contribution reduced by 50%.
+    """
     global _emergency_phase, _emergency_start_time, _emergency_reason
-    global _emergency_last_sent
+    global _emergency_last_sent, _emergency_confirm_count
 
     now = time.time()
 
+    # ── Oscillation tracking (unchanged) ──────────────────────────────────
     if _is_dangerous_oscillation(raw_cmd, prev_raw):
         _oscillation_timestamps.append(now)
     while (_oscillation_timestamps
            and (now - _oscillation_timestamps[0]) > OSCILLATION_GUARD_WINDOW):
         _oscillation_timestamps.popleft()
 
+    # ── IDLE phase ────────────────────────────────────────────────────────
     if _emergency_phase == _EMERG_IDLE:
+
+        # v8: combined suppression factor from blur + shake guards
+        suppress = blur_guard.suppression_factor() * camera_shake.suppression_factor()
+
+        # v8 IMPROVEMENT 2 + 7 + 4: centre-corridor check with suppression
+        center_danger = []
         for obs in live_obstacles:
-            if obs.proximity >= EMERGENCY_AREA_FRAC:
-                _emergency_phase      = _EMERG_ACTIVE
-                _emergency_start_time = now
-                _emergency_reason     = (f"obstacle {obs.proximity*100:.0f}% "
-                                         f">= {EMERGENCY_AREA_FRAC*100:.0f}%")
-                _emergency_last_sent  = 0.0
-                _oscillation_timestamps.clear()
-                event_log.log("EMERGENCY", f"Entered — {_emergency_reason}",
-                              proximity=obs.proximity)
-                return True
-        if len(_oscillation_timestamps) > OSCILLATION_GUARD_LIMIT:
-            _emergency_phase      = _EMERG_ACTIVE
-            _emergency_start_time = now
-            _emergency_reason     = "oscillation guard"
+            if obs.zone != "CENTER" or obs.v_zone != "MIDDLE":
+                continue
+
+            # Apply combined suppression to effective proximity
+            eff_prox = obs.proximity * suppress
+
+            # IMPROVEMENT 2: penalise non-approaching obstacles
+            approach_weight = approach_tracker.velocity(obs.tid)
+            # approach_weight is a raw velocity (fractional area/s).
+            # If velocity ≤ 0 the object is not closing — reduce contribution.
+            if approach_weight <= 0:
+                eff_prox *= 0.60   # 40% reduction for stationary/receding objects
+            elif approach_weight < _APPROACH_MIN_GROWTH:
+                eff_prox *= float(np.clip(
+                    0.60 + 0.40 * (approach_weight / _APPROACH_MIN_GROWTH), 0.60, 1.0))
+
+            if eff_prox >= _EMERGENCY_ENTER_FRAC:
+                center_danger.append(obs)
+
+        is_dangerous = len(center_danger) > 0
+
+        # v8 IMPROVEMENT 6: update danger confidence accumulator
+        danger_confidence.update_danger(is_dangerous)
+
+        if is_dangerous:
+            _emergency_confirm_count += 1
+            event_log.log(
+                "WATCHDOG",
+                f"ES confirm {_emergency_confirm_count}/{_EMERGENCY_CONFIRM_FRAMES} "
+                f"| DangerConf {danger_confidence.confidence:.2f}/{_DANGER_CONF_THRESH:.2f} "
+                f"| BlurSupp {blur_guard.suppression_factor():.2f} "
+                f"| ShakeSupp {camera_shake.suppression_factor():.2f} "
+                f"| prox {max(o.proximity for o in center_danger) * 100:.0f}%",
+            )
+        else:
+            _emergency_confirm_count = max(0, _emergency_confirm_count - 2)
+
+        # v8: BOTH confirmation frames AND danger confidence must be satisfied
+        if (_emergency_confirm_count >= _EMERGENCY_CONFIRM_FRAMES
+                and danger_confidence.ready):
+
+            # Final blur/shake check — if still heavily suppressed, defer
+            if suppress < 0.40:
+                event_log.log(
+                    "WATCHDOG",
+                    f"ES deferred — combined suppression {suppress:.2f} too low "
+                    f"(blur={blur_guard.suppression_factor():.2f} "
+                    f"shake={camera_shake.suppression_factor():.2f})",
+                )
+                _emergency_confirm_count = max(0, _emergency_confirm_count - 3)
+                return False
+
+            worst = max(center_danger, key=lambda o: o.proximity)
+            _emergency_phase         = _EMERG_ACTIVE
+            _emergency_start_time    = now
+            _emergency_confirm_count = 0
+            danger_confidence.reset()
+            _emergency_reason = (
+                f"CENTER obstacle {worst.proximity * 100:.0f}% "
+                f">= {_EMERGENCY_ENTER_FRAC * 100:.0f}% "
+                f"({_EMERGENCY_CONFIRM_FRAMES} frames + conf "
+                f"{danger_confidence._threshold:.2f} confirmed)"
+            )
             _emergency_last_sent  = 0.0
+            _oscillation_timestamps.clear()
+            event_log.log("EMERGENCY", f"Entered — {_emergency_reason}",
+                          proximity=worst.proximity)
+            return True
+
+        # Oscillation guard (unchanged)
+        if len(_oscillation_timestamps) > OSCILLATION_GUARD_LIMIT:
+            _emergency_phase         = _EMERG_ACTIVE
+            _emergency_start_time    = now
+            _emergency_reason        = "oscillation guard"
+            _emergency_last_sent     = 0.0
+            _emergency_confirm_count = 0
+            danger_confidence.reset()
             _oscillation_timestamps.clear()
             event_log.log("EMERGENCY", "Entered — oscillation guard")
             return True
+
         return False
 
+    # ── ACTIVE phase (unchanged from v7) ──────────────────────────────────
     if _emergency_phase == _EMERG_ACTIVE:
         elapsed = now - _emergency_start_time
         if elapsed < EMERGENCY_HOLD_DURATION:
@@ -1520,22 +2311,27 @@ def _check_emergency(raw_cmd: str, prev_raw: str,
         _emergency_start_time = now
         event_log.log("EMERGENCY", "Hold elapsed → RECOVERY phase")
 
+    # ── RECOVERY phase (unchanged from v7) ────────────────────────────────
     if _emergency_phase == _EMERG_RECOVERY:
         max_live_prox = max((obs.proximity for obs in live_obstacles), default=0.0)
-        if max_live_prox < SAFE_RELEASE_FRAC:
-            _emergency_phase  = _EMERG_IDLE
-            _emergency_reason = ""
-            event_log.log("EMERGENCY",
-                          f"Released — live prox {max_live_prox*100:.0f}% < threshold")
+        if max_live_prox < _EMERGENCY_EXIT_FRAC:
+            _emergency_phase         = _EMERG_IDLE
+            _emergency_reason        = ""
+            _emergency_confirm_count = 0
+            danger_confidence.reset()
+            event_log.log(
+                "EMERGENCY",
+                f"Released — live prox {max_live_prox * 100:.0f}% "
+                f"< {_EMERGENCY_EXIT_FRAC * 100:.0f}% (exit threshold)",
+            )
             return False
         if now - _emergency_last_sent >= EMERGENCY_RESEND_INTERVAL:
             _emergency_last_sent = now
             event_log.log("WATCHDOG",
-                          f"Recovery blocked — prox {max_live_prox*100:.0f}%")
+                          f"Recovery blocked — prox {max_live_prox * 100:.0f}%")
         return True
 
     return False
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SPEED-TIERED FORWARD (unchanged)
@@ -2432,7 +3228,18 @@ def draw_nav_overlay(frame: np.ndarray, nav_cmd: str,
     visible_obs = [o for o in obstacles if o.proximity >= SIDE_DANGER_FRAC * 0.7]
     draw_danger_boxes(frame, visible_obs)
 
-    is_emergency_cmd = nav_cmd in (NAV_EMERGENCY_STOP, MOVE_EMERGENCY_STOP)
+    # ── Collision emergency banner (highest visual priority) ──────────────
+    if camera_shake.check_collision_emergency():
+        elapsed_col = camera_shake.collision_active_elapsed
+        col_banner  = f"⚡ EMERGENCY COLLISION DETECTED  ({elapsed_col:.1f}s)  ⚡"
+        (bw, bh), _ = cv2.getTextSize(col_banner, cv2.FONT_HERSHEY_SIMPLEX, 0.80, 2)
+        bx = (frame_w - bw) // 2
+        cv2.rectangle(frame, (0, 0), (frame_w, 50), (0, 0, 180), -1)
+        cv2.putText(frame, col_banner, (max(4, bx), 36),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.80, (255, 80, 80), 2)
+
+    is_emergency_cmd = nav_cmd in (NAV_EMERGENCY_STOP, MOVE_EMERGENCY_STOP,
+                                   MOVE_BACKOFF)
     if is_emergency_cmd:
         in_recovery  = (_emergency_phase == _EMERG_RECOVERY)
         banner       = ("⚠  RECOVERING FROM EMERGENCY  ⚠"
@@ -2558,7 +3365,7 @@ except Exception as e:
 # ══════════════════════════════════════════════════════════════════════════════
 
 STREAM_PORT = 8080
-stream_url  = f"http://192.168.1.4:{STREAM_PORT}/video"
+stream_url  = f"http://192.168.1.5:{STREAM_PORT}/video"
 
 _frame_lock    = threading.Lock()
 _latest_frame: Optional[np.ndarray] = None
@@ -2750,6 +3557,97 @@ def _scale_frame_for_display(frame: np.ndarray) -> np.ndarray:
     new_w = max(1, int(w * scale))
     new_h = max(1, int(h * scale))
     return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  v7 FIX-9 — PROXIMITY DEBUG OVERLAY  (DEBUG_MODE only, zero-cost otherwise)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def draw_proximity_debug_overlay(
+    frame: np.ndarray,
+    obstacles: List[ObstacleInfo],
+    frame_w: int,
+    frame_h: int,
+) -> None:
+    """
+    Debug-only overlay showing per-obstacle proximity diagnostics and the
+    emergency confirmation counter.  Drawn only in DEBUG_MODE — strict no-op
+    in all other runtime modes.
+
+    Visualises:
+      • Centre-corridor boundary rectangle (the only zone checked for ES)
+      • Per-obstacle: zone, v_zone, smoothed proximity %, colour-coded bar
+      • Highlight when obstacle is inside the ES corridor
+      • Emergency confirm counter progress vs required frames
+      • Active entry / exit threshold values
+    """
+    if not _mode_is_debug():
+        return
+
+    # ── Centre-corridor boundary (the ES-eligible zone) ───────────────────
+    lx = int(frame_w * LEFT_ZONE_END)
+    rx = int(frame_w * RIGHT_ZONE_START)
+    ty = int(frame_h * TOP_ZONE_END)
+    by = int(frame_h * BOTTOM_ZONE_START)
+    cv2.rectangle(frame, (lx, ty), (rx, by), (0, 255, 255), 1)
+    cv2.putText(frame, "ES CORRIDOR", (lx + 4, ty + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 255), 1)
+
+    # ── Per-obstacle proximity bars ───────────────────────────────────────
+    for obs in obstacles:
+        x1, y1, x2, y2 = obs.box
+        prox_pct = int(obs.proximity * 100)
+
+        # Colour tier: green < 40%, orange < 70%, red >= 70%
+        if obs.proximity < 0.40:
+            bar_col = (0, 200, 0)
+        elif obs.proximity < 0.70:
+            bar_col = (0, 165, 255)
+        else:
+            bar_col = (0, 0, 220)
+
+        # Vertical bar on left edge of detection box, height ∝ proximity
+        bar_h   = max(4, int((y2 - y1) * obs.proximity))
+        bar_top = y2 - bar_h
+        cv2.rectangle(frame, (x1 - 8, bar_top), (x1 - 2, y2), bar_col, -1)
+
+        # Proximity + zone label; cyan when inside the ES corridor
+        in_corridor = (obs.zone == "CENTER" and obs.v_zone == "MIDDLE")
+        label_col   = (0, 255, 255) if in_corridor else (180, 180, 180)
+        cv2.putText(frame, f"{prox_pct}% {obs.zone}/{obs.v_zone}",
+                    (x1, max(12, y1 - 2)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, label_col, 1)
+
+    # ── Emergency confirmation counter ────────────────────────────────────
+    conf_color = (0, 80, 220) if _emergency_confirm_count > 0 else (140, 140, 140)
+    conf_text  = (f"ES confirm: {_emergency_confirm_count}/"
+                  f"{_EMERGENCY_CONFIRM_FRAMES}  "
+                  f"DangerConf:{danger_confidence.confidence:.2f}/{_DANGER_CONF_THRESH:.2f}  "
+                  f"phase:{_emergency_phase}")
+    cv2.rectangle(frame, (0, frame_h - 24), (850, frame_h), (20, 20, 20), -1)
+    cv2.putText(frame, conf_text, (4, frame_h - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, conf_color, 1)
+
+    # ── Threshold labels ──────────────────────────────────────────────────
+    thresh_text = (f"ENTER>={_EMERGENCY_ENTER_FRAC:.0%}  "
+                   f"EXIT<{_EMERGENCY_EXIT_FRAC:.0%}  "
+                   f"min_area={_MIN_OBS_AREA_FRAC:.3f}  "
+                   f"max_asp={_MAX_OBS_ASPECT:.1f}  "
+                   f"confirm={_EMERGENCY_CONFIRM_FRAMES}fr")
+    cv2.putText(frame, thresh_text, (4, frame_h - 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (160, 160, 160), 1)
+
+    # ── Suppression state bar ────────────────────────────────────────────
+    blur_s  = blur_guard.suppression_factor()
+    shake_s = camera_shake.suppression_factor()
+    combined = blur_s * shake_s
+    s_col   = (0, 200, 0) if combined > 0.85 else (0, 165, 255) if combined > 0.50 else (0, 0, 220)
+    supp_text = (f"BlurSupp:{blur_s:.2f}  ShakeFlow:{camera_shake.mean_flow:.1f}px  "
+                 f"ShakeSupp:{shake_s:.2f}  Combined:{combined:.2f}  "
+                 f"Blur={'ON' if blur_guard.is_suppressed else 'OFF'}  "
+                 f"Shake={'ON' if camera_shake.is_shaking else 'OFF'}")
+    cv2.putText(frame, supp_text, (4, frame_h - 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, s_col, 1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3000,12 +3898,26 @@ def main():
             # IMPROVEMENT 4: advance virtual sensor suite
             virtual_sensors.tick(master_motion)
 
+            # v8: update blur guard (uses raw boxes before size filtering)
+            blur_guard.update(boxes, w_disp * h_disp)
+
+            # v8: update camera-shake detector (uses raw display frame)
+            camera_shake.update(display_frame)
+
+            # v8: evict stale tracker state
+            active_tids = {b[5] for b in boxes if b[5] >= 0}
+            bbox_stability.evict_stale(active_tids)
+            approach_tracker.evict_stale(active_tids)
+
             draw_nav_overlay(display_frame, master_motion, obstacles, danger_obs,
                              w_disp, h_disp)
 
             # IMPROVEMENT 5: simulation HUD overlay
             draw_simulation_hud(display_frame, w_disp, h_disp,
                                  master_motion, master_owner, nav_state)
+
+            # v7 FIX-9: proximity debug overlay (DEBUG_MODE only — no-op otherwise)
+            draw_proximity_debug_overlay(display_frame, obstacles, w_disp, h_disp)
 
             perf.record_frame_latency((time.perf_counter() - t_frame_start) * 1000)
 
@@ -3040,6 +3952,7 @@ def main():
                 f"Dr State: {drone_state}",
                 f"NAV FSM : {nav_cmd}",
                 f"Depth   : {top_prox}",
+                f"ES Cnfrm: {_emergency_confirm_count}/{_EMERGENCY_CONFIRM_FRAMES}",
                 f"Mem Obs : {mem_count}",
                 f"Low Pwr : {'ON' if _low_power_mode else 'OFF'}",
                 f"Serial  : {'ON' if flight_controller.is_connected() else 'OFF (dry-run)'}",
