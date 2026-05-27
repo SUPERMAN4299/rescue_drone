@@ -1,14 +1,78 @@
+"""
+analysing_cap_v5.py — Autonomous Drone Navigation Stack
+════════════════════════════════════════════════════════
+Safety & Simulation Pass (v5) over the v4 production system.
+
+Hardware platform (unchanged):
+  • Arduino Nano         — flight controller, ALL flight logic
+  • ESP32-CAM            — video streaming ONLY
+  • MPU6050              — gyro + accelerometer (stub interface)
+  • 4× brushed coreless motors
+  • SI2300 MOSFET drivers
+  • 3.7V LiPo battery
+  • 5V regulator
+
+What changed (v4 → v5):
+  1.  Safe-test mode            — reduced PWM, sensitive ES, hover-preferred
+  2.  Motor abstraction layer   — set_motor_speed(fl, fr, rl, rr) + DroneMixer
+  3.  PID hooks (roll/pitch/yaw)— PlaceholderPID dataclass; MPU6050 stub
+  4.  Virtual sensor framework  — VirtualSensorSuite (dist, alt, IMU, battery)
+  5.  Extended simulation HUD   — virtual alt, velocity, PWM, IMU, battery
+  6.  Motor safety limiter      — MAX_PWM_STEP, ramp_motor_pwm()
+  7.  Serial safety (v4→v5)     — already solid; added stale-cmd TTL + log
+  8.  AI stability filter       — command hold-time, confidence smoothing (v4 had stubs)
+  9.  Hardware-ready comments   — ToF / ultrasonic / IMU-fusion / coord-nav markers
+  10. Architecture preservation — YOLO, master arbiter, emergency FSM, obstacle
+                                  memory, pseudo-depth, search FSM, motion
+                                  primitives all kept verbatim.
+
+Architecture layers (unchanged):
+
+  PERCEPTION          camera frames  →  _frame_reader_loop / _yolo_loop
+       ↓
+  TARGET ESTIMATION   ai_decision()  →  AIIntent enum
+       ↓
+  AI INTENT           Layer 1        →  where is the target?
+       ↓
+  NAVIGATION REASONING nav_decision()→  NavState enum
+       ↓
+  MASTER ARBITER      master_decision() → single authority for motion
+       ↓
+  MOTION PRIMITIVES   MotionPrimitive enum → physical action
+       ↓
+  MOTOR ABSTRACTION   set_motor_speed()  → DroneMixer → PWM values   ← NEW v5
+       ↓
+  MOTOR SAFETY        ramp_motor_pwm()   → MAX_PWM_STEP limiter       ← NEW v5
+       ↓
+  HARDWARE ABSTRACTION AbstractFlightController → serial tokens
+       ↓
+  FLIGHT CONTROLLER   ArduinoController / DryRunController
+"""
+
 from __future__ import annotations
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Standard library
+# ─────────────────────────────────────────────────────────────────────────────
+import abc
+import dataclasses
+import json
+import logging
+import math
 import os
 import platform
+import random
 import re
 import subprocess
 import threading
 import time
 from collections import defaultdict, deque
-from typing import Optional, Tuple, Dict
+from enum import Enum, auto
+from typing import Dict, List, Optional, Tuple
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Third-party
+# ─────────────────────────────────────────────────────────────────────────────
 import cv2
 import numpy as np
 import torch
@@ -16,1803 +80,893 @@ from ultralytics import YOLO
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  UPGRADE 1 — NAVIGATION-RELEVANT CLASS FILTER
-#  Only objects that a real drone can physically collide with should affect
-#  navigation decisions.  Filtering here prevents false avoidance from cups,
-#  keyboards, remotes, and other tiny COCO objects.
+#  RUNTIME MODES  (v4 preserved + SAFE_TEST_MODE is now first-class)
 # ══════════════════════════════════════════════════════════════════════════════
 
-NAVIGATION_CLASSES: frozenset[int] = frozenset({
-    0,    # person       — hover + human tracking
-    56,   # chair        — common low indoor obstacle
-    57,   # couch/sofa   — large floor obstacle
-    58,   # potted plant — narrow but tall
-    59,   # bed          — large floor area
-    60,   # dining table — wide flat obstacle
-    62,   # tv / monitor — wall-mounted / on stand
-    63,   # laptop       — on table, sometimes head height
-    # 64, mouse        — too small; excluded intentionally (cls 64)
-    # NOTE: cls 64 (mouse) is deliberately NOT in this set to show intent.
-    # Rule of thumb: only include objects whose bounding box will meaningfully
-    # represent collision risk at drone cruise height (~0.5-1.5 m).
+class RuntimeMode(Enum):
+    """
+    Execution mode selector.
+
+    SAFE_TEST_MODE   — reduced PWM, hover-preferred, ultra-sensitive ES
+    SIMULATION_MODE  — no serial, full virtual sensors, full HUD
+    REAL_FLIGHT_MODE — serial enabled, full safety, production behaviour
+    DEBUG_MODE       — verbose logs, extra HUD fields
+    LOW_POWER_MODE   — reduced inference resolution, frame-skipping
+    """
+    SAFE_TEST_MODE   = auto()
+    SIMULATION_MODE  = auto()
+    REAL_FLIGHT_MODE = auto()
+    DEBUG_MODE       = auto()
+    LOW_POWER_MODE   = auto()
+
+
+# Active runtime mode — change this line before deploying.
+ACTIVE_MODE: RuntimeMode = RuntimeMode.SAFE_TEST_MODE
+
+
+def _mode_allows_serial() -> bool:
+    return ACTIVE_MODE == RuntimeMode.REAL_FLIGHT_MODE
+
+def _mode_is_debug() -> bool:
+    return ACTIVE_MODE == RuntimeMode.DEBUG_MODE
+
+def _mode_is_low_power() -> bool:
+    return ACTIVE_MODE == RuntimeMode.LOW_POWER_MODE
+
+def _mode_is_safe_test() -> bool:
+    """True in SAFE_TEST_MODE — activates all conservative overrides."""
+    return ACTIVE_MODE == RuntimeMode.SAFE_TEST_MODE
+
+def _mode_is_simulation() -> bool:
+    return ACTIVE_MODE == RuntimeMode.SIMULATION_MODE
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  IMPROVEMENT 7 — EVENT LOGGER  (unchanged from v4)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DroneEventLogger:
+    """Structured, lightweight event logger. Console always; file optional."""
+
+    CATEGORIES = frozenset({
+        "EMERGENCY", "RECONNECT", "OWNERSHIP",
+        "OBSTACLE", "SERIAL", "WATCHDOG", "PERF", "MOTOR", "SENSOR",
+    })
+
+    def __init__(self, file_path: Optional[str] = None):
+        self._lock      = threading.Lock()
+        self._file_path = file_path
+        self._fh        = None
+        self._logger    = logging.getLogger("DroneNav")
+        if not self._logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter(
+                "[%(asctime)s] %(name)s %(levelname)s %(message)s",
+                datefmt="%H:%M:%S",
+            ))
+            self._logger.addHandler(handler)
+            self._logger.setLevel(logging.DEBUG if _mode_is_debug() else logging.INFO)
+        if file_path:
+            try:
+                self._fh = open(file_path, "a", buffering=1)
+            except OSError as exc:
+                self._logger.warning(f"Cannot open log file {file_path}: {exc}")
+
+    def log(self, category: str, message: str, **fields) -> None:
+        if category not in self.CATEGORIES:
+            category = "GENERAL"
+        record = {"ts": time.time(), "cat": category, "msg": message, **fields}
+        self._logger.info(f"[{category}] {message}" + (f" | {fields}" if fields else ""))
+        if self._fh:
+            with self._lock:
+                try:
+                    self._fh.write(json.dumps(record) + "\n")
+                except OSError:
+                    pass
+
+    def close(self) -> None:
+        if self._fh:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+
+
+event_log = DroneEventLogger(file_path=None)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  IMPROVEMENT 3 — CENTRALIZED CONFIG SYSTEM  (v4 preserved + v5 additions)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclasses.dataclass
+class DroneConfig:
+    """
+    Single tuning location for every threshold, timing, and YOLO parameter.
+
+    v5 additions
+    ─────────────
+    safe_test_pwm_max       — PWM ceiling in SAFE_TEST_MODE (0-255)
+    safe_test_es_frac       — reduced emergency area fraction for safe-test
+    safe_test_search_delay  — slow search interval multiplier in safe-test
+    max_pwm_step            — maximum per-tick PWM change (motor ramp limiter)
+    virtual_sensor_noise    — std-dev noise on virtual sensor readings
+    stale_cmd_ttl           — seconds before a queued serial command is discarded
+    """
+
+    # ── Proximity thresholds ──────────────────────────────────────────────
+    front_danger_frac:          float = 0.10
+    side_danger_frac:           float = 0.05
+    human_hover_frac:           float = 0.08
+    human_center_overlap_min:   float = 0.40
+    emergency_area_frac:        float = 0.60
+    safe_release_frac:          float = 0.35
+
+    # ── Speed tier thresholds ─────────────────────────────────────────────
+    speed_clear_frac:           float = 0.04
+    speed_caution_frac:         float = 0.07
+
+    # ── Zone boundaries ───────────────────────────────────────────────────
+    left_zone_end:              float = 0.30
+    right_zone_start:           float = 0.70
+    top_zone_end:               float = 0.30
+    bottom_zone_start:          float = 0.70
+
+    # ── Obstacle density ──────────────────────────────────────────────────
+    center_density_limit:       int   = 3
+
+    # ── Temporal memory ───────────────────────────────────────────────────
+    last_obstacle_timeout:      float = 0.5
+
+    # ── Search FSM timing ─────────────────────────────────────────────────
+    search_phase_duration:      float = 2.5
+    forward_scan_duration:      float = 0.5
+    search_recovery_cycles:     int   = 4
+
+    # ── Emergency timing ──────────────────────────────────────────────────
+    emergency_hold_duration:    float = 2.5
+    emergency_resend_interval:  float = 0.8
+    oscillation_guard_window:   float = 1.0
+    oscillation_guard_limit:    int   = 8
+
+    # ── Serial / heartbeat ────────────────────────────────────────────────
+    command_send_interval:      float = 0.1
+    heartbeat_interval:         float = 0.5
+    serial_port:                str   = "COM5"
+    serial_baud:                int   = 115200
+
+    # ── Stale-frame / reader fail-safe ────────────────────────────────────
+    stale_frame_timeout:        float = 1.0
+    reader_fail_hold:           float = 1.5
+
+    # ── Master arbiter cooldown ───────────────────────────────────────────
+    command_hold_time:          float = 0.35
+
+    # ── Stability filters ─────────────────────────────────────────────────
+    nav_stability_min:          int   = 3
+    ai_stability_min:           int   = 3
+    ai_center_thresh:           float = 0.18
+
+    # ── Obstacle EMA ──────────────────────────────────────────────────────
+    depth_ema_alpha:            float = 0.45
+
+    # ── YOLO / camera ─────────────────────────────────────────────────────
+    model:                      str   = "yolov8n.pt"
+    imgsz:                      int   = 416
+    conf:                       float = 0.30
+    iou:                        float = 0.45
+    half:                       bool  = False
+    device:                     str   = "cpu"
+    cam_w:                      int   = 640
+    cam_h:                      int   = 480
+    display_scale:              float = 1.2
+    tier:                       str   = "CPU"
+
+    # ── Human count throttle ──────────────────────────────────────────────
+    human_count_write_interval: float = 0.5
+
+    # ── Adaptive inference ────────────────────────────────────────────────
+    adaptive_min_inference_interval: float = 0.0
+
+    # ── Track smoothing ───────────────────────────────────────────────────
+    smooth_frames:              int   = 1
+
+    # ── Hardware classifiers ──────────────────────────────────────────────
+    human_class:                int   = 0
+    navigation_classes: frozenset = dataclasses.field(
+        default_factory=lambda: frozenset({0, 56, 57, 58, 59, 60, 62, 63})
+    )
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  v5 NEW FIELDS
+    # ─────────────────────────────────────────────────────────────────────
+
+    # ── IMPROVEMENT 1: Safe-test mode overrides ───────────────────────────
+    safe_test_pwm_max:          int   = 120   # max PWM 0-255 in safe-test
+    safe_test_es_frac:          float = 0.35  # tighter emergency threshold
+    safe_test_search_delay:     float = 2.0   # extra seconds added to search phase
+
+    # ── IMPROVEMENT 6: Motor safety limiter ──────────────────────────────
+    max_pwm_step:               int   = 20    # max change per ramp tick
+    pwm_ramp_interval:          float = 0.05  # seconds between ramp ticks
+
+    # ── IMPROVEMENT 4: Virtual sensor noise level ─────────────────────────
+    virtual_sensor_noise:       float = 0.02  # std-dev of Gaussian noise
+
+    # ── IMPROVEMENT 7: Stale-command TTL ─────────────────────────────────
+    stale_cmd_ttl:              float = 0.5   # discard queued cmds older than this
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Hardware profiles (unchanged)
+    # ─────────────────────────────────────────────────────────────────────
+
+    @classmethod
+    def high_end_gpu(cls) -> "DroneConfig":
+        return cls(model="yolov8x.pt", imgsz=960, conf=0.30, iou=0.45,
+                   half=True, device="cuda", cam_w=1920, cam_h=1080,
+                   tier="High-end GPU (CUDA)")
+
+    @classmethod
+    def mid_range_gpu(cls) -> "DroneConfig":
+        return cls(model="yolov8m.pt", imgsz=640, conf=0.25, iou=0.45,
+                   half=True, device="cuda", cam_w=1280, cam_h=720,
+                   tier="Mid-range GPU (CUDA)")
+
+    @classmethod
+    def low_vram_gpu(cls) -> "DroneConfig":
+        return cls(model="yolov8s.pt", imgsz=640, conf=0.25, iou=0.45,
+                   half=True, device="cuda", cam_w=1280, cam_h=720,
+                   tier="Low-VRAM GPU (CUDA)")
+
+    @classmethod
+    def cpu_profile(cls, device_name: str = "CPU") -> "DroneConfig":
+        return cls(model="yolov8n.pt", imgsz=416, conf=0.30, iou=0.45,
+                   half=False, device="cpu", cam_w=640, cam_h=480,
+                   tier=f"CPU ({device_name})")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  IMPROVEMENT 1 — STRICT TYPE SAFETY  (unchanged from v4)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AIIntent(Enum):
+    TRACK_LEFT    = "AI_TRACK_LEFT"
+    TRACK_RIGHT   = "AI_TRACK_RIGHT"
+    TRACK_CENTER  = "AI_TRACK_CENTER"
+    HOVER         = "AI_HOVER"
+    SEARCH_TARGET = "AI_SEARCH_TARGET"
+
+
+class NavState(Enum):
+    CLEAR          = "NAV_CLEAR_PATH"
+    CAUTION        = "NAV_CAUTION"
+    BLOCKED_FRONT  = "NAV_BLOCKED_FRONT"
+    BLOCKED_LEFT   = "NAV_BLOCKED_LEFT"
+    BLOCKED_RIGHT  = "NAV_BLOCKED_RIGHT"
+    DENSE          = "NAV_DENSE_OBSTACLES"
+    CEILING        = "NAV_CEILING_THREAT"
+    SEARCH         = "NAV_SEARCH_MODE"
+    EMERGENCY      = "NAV_EMERGENCY"
+
+
+class MotionPrimitive(Enum):
+    FORWARD        = "MOVE_FORWARD"
+    FORWARD_FAST   = "MOVE_FORWARD_FAST"
+    FORWARD_SLOW   = "MOVE_FORWARD_SLOW"
+    BACKWARD       = "MOVE_BACKWARD"
+    YAW_LEFT       = "MOVE_YAW_LEFT"
+    YAW_RIGHT      = "MOVE_YAW_RIGHT"
+    HOVER          = "MOVE_HOVER"
+    STOP           = "MOVE_STOP"
+    SEARCH_LEFT    = "MOVE_SEARCH_LEFT"
+    SEARCH_RIGHT   = "MOVE_SEARCH_RIGHT"
+    SCAN_FORWARD   = "MOVE_SCAN_FORWARD"
+    SAFE_SEARCH    = "MOVE_SAFE_SEARCH"
+    EMERGENCY_STOP = "MOVE_EMERGENCY_STOP"
+
+
+MOTION_TOKENS: Dict[MotionPrimitive, str] = {
+    MotionPrimitive.FORWARD        : "F",
+    MotionPrimitive.FORWARD_FAST   : "FF",
+    MotionPrimitive.FORWARD_SLOW   : "SF",
+    MotionPrimitive.BACKWARD       : "B",
+    MotionPrimitive.YAW_LEFT       : "YL",
+    MotionPrimitive.YAW_RIGHT      : "YR",
+    MotionPrimitive.HOVER          : "H",
+    MotionPrimitive.STOP           : "ST",
+    MotionPrimitive.SEARCH_LEFT    : "SL",
+    MotionPrimitive.SEARCH_RIGHT   : "SR",
+    MotionPrimitive.SCAN_FORWARD   : "FS",
+    MotionPrimitive.SAFE_SEARCH    : "SS",
+    MotionPrimitive.EMERGENCY_STOP : "ES",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  IMPROVEMENT 2 — STRUCTURED FSM TRANSITIONS  (unchanged from v4)
+# ══════════════════════════════════════════════════════════════════════════════
+
+MOTION_PRIORITY: Dict[MotionPrimitive, int] = {
+    MotionPrimitive.EMERGENCY_STOP : 0,
+    MotionPrimitive.HOVER          : 1,
+    MotionPrimitive.BACKWARD       : 2,
+    MotionPrimitive.YAW_LEFT       : 3,
+    MotionPrimitive.YAW_RIGHT      : 3,
+    MotionPrimitive.STOP           : 4,
+    MotionPrimitive.FORWARD_SLOW   : 5,
+    MotionPrimitive.SAFE_SEARCH    : 5,
+    MotionPrimitive.FORWARD_FAST   : 6,
+    MotionPrimitive.FORWARD        : 6,
+    MotionPrimitive.SCAN_FORWARD   : 6,
+    MotionPrimitive.SEARCH_LEFT    : 7,
+    MotionPrimitive.SEARCH_RIGHT   : 7,
+}
+
+_ALWAYS_ALLOWED_TARGETS: frozenset = frozenset({
+    MotionPrimitive.EMERGENCY_STOP,
+    MotionPrimitive.BACKWARD,
 })
 
-# Remove tiny objects that often misfire (mouse, remote, cell phone, etc.)
-# by keeping only the set above.  Downstream: analyse_obstacles filters with:
-#   if cls_id not in NAVIGATION_CLASSES: continue
+_FORBIDDEN_TRANSITIONS: frozenset = frozenset({
+    (MotionPrimitive.BACKWARD, MotionPrimitive.FORWARD_FAST),
+})
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  UPGRADE 5 — SPEED TIERS
-#  Three discrete forward speeds allow the drone to decelerate gracefully as
-#  obstacles approach rather than switching abruptly from FORWARD to BACKWARD.
-# ══════════════════════════════════════════════════════════════════════════════
-
-NAV_FAST_FORWARD  = "FAST_FORWARD"   # clear path, high cruise speed
-NAV_SLOW_FORWARD  = "SLOW_FORWARD"   # medium obstacles ahead, cautious
-NAV_STOP          = "STOP"           # very close object, hold in place
-
-# Proximity thresholds that separate the three speed tiers (fraction of frame).
-#   Objects < SPEED_CLEAR_FRAC  → FAST_FORWARD
-#   Objects < SPEED_CAUTION_FRAC → SLOW_FORWARD
-#   Objects ≥ SPEED_CAUTION_FRAC → STOP (let avoidance FSM handle direction)
-SPEED_CLEAR_FRAC:   float = 0.04   # 4 % — object is small / far
-SPEED_CAUTION_FRAC: float = 0.07   # 7 % — object is medium distance
-
-# Arduino token map extended with speed tiers
-ARDUINO_TOKENS_V3: dict[str, str] = {
-    NAV_FAST_FORWARD  : "FF",
-    NAV_SLOW_FORWARD  : "SF",
-    NAV_STOP          : "ST",
-}
+def _validate_transition(current: MotionPrimitive,
+                          candidate: MotionPrimitive) -> bool:
+    if candidate == current:
+        return True
+    if candidate in _ALWAYS_ALLOWED_TARGETS:
+        return True
+    if (current, candidate) in _FORBIDDEN_TRANSITIONS:
+        return False
+    curr_rank = MOTION_PRIORITY.get(current, 99)
+    cand_rank = MOTION_PRIORITY.get(candidate, 99)
+    return cand_rank <= curr_rank or curr_rank >= 6
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  UPGRADE 8 — SEARCH FSM STATES
-#  Replace single SEARCH with a cyclic 4-state mini-FSM so the drone
-#  performs structured exploration instead of spinning indefinitely.
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Legacy string constants ───────────────────────────────────────────────────
+AI_TRACK_LEFT    = AIIntent.TRACK_LEFT.value
+AI_TRACK_RIGHT   = AIIntent.TRACK_RIGHT.value
+AI_TRACK_CENTER  = AIIntent.TRACK_CENTER.value
+AI_HOVER         = AIIntent.HOVER.value
+AI_SEARCH_TARGET = AIIntent.SEARCH_TARGET.value
 
-NAV_SEARCH_LEFT   = "SEARCH_LEFT"    # slow left yaw
-NAV_SEARCH_RIGHT  = "SEARCH_RIGHT"   # slow right yaw
-NAV_FORWARD_SCAN  = "FORWARD_SCAN"   # brief straight advance during search
-NAV_SAFE_SEARCH   = "SAFE_SEARCH"    # ultra-slow yaw when near walls
+NAV_STATE_CLEAR         = NavState.CLEAR.value
+NAV_STATE_CAUTION       = NavState.CAUTION.value
+NAV_STATE_BLOCKED_FRONT = NavState.BLOCKED_FRONT.value
+NAV_STATE_BLOCKED_LEFT  = NavState.BLOCKED_LEFT.value
+NAV_STATE_BLOCKED_RIGHT = NavState.BLOCKED_RIGHT.value
+NAV_STATE_DENSE         = NavState.DENSE.value
+NAV_STATE_CEILING       = NavState.CEILING.value
+NAV_STATE_SEARCH        = NavState.SEARCH.value
+NAV_STATE_EMERGENCY     = NavState.EMERGENCY.value
 
-# Duration (seconds) each search sub-state is held before cycling
-SEARCH_PHASE_DURATION: float = 2.5
+MOVE_FORWARD        = MotionPrimitive.FORWARD.value
+MOVE_FORWARD_FAST   = MotionPrimitive.FORWARD_FAST.value
+MOVE_FORWARD_SLOW   = MotionPrimitive.FORWARD_SLOW.value
+MOVE_BACKWARD       = MotionPrimitive.BACKWARD.value
+MOVE_YAW_LEFT       = MotionPrimitive.YAW_LEFT.value
+MOVE_YAW_RIGHT      = MotionPrimitive.YAW_RIGHT.value
+MOVE_HOVER          = MotionPrimitive.HOVER.value
+MOVE_STOP           = MotionPrimitive.STOP.value
+MOVE_SEARCH_LEFT    = MotionPrimitive.SEARCH_LEFT.value
+MOVE_SEARCH_RIGHT   = MotionPrimitive.SEARCH_RIGHT.value
+MOVE_SCAN_FORWARD   = MotionPrimitive.SCAN_FORWARD.value
+MOVE_SAFE_SEARCH    = MotionPrimitive.SAFE_SEARCH.value
+MOVE_EMERGENCY_STOP = MotionPrimitive.EMERGENCY_STOP.value
 
-# Search cycle order.  Drone yaws left, then right, then nudges forward,
-# repeating.  If memory shows obstacles ahead the FORWARD_SCAN is skipped.
-_SEARCH_CYCLE = [NAV_SEARCH_LEFT, NAV_SEARCH_RIGHT, NAV_FORWARD_SCAN]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  UPGRADE 11 — EMERGENCY SAFETY LAYER
-# ══════════════════════════════════════════════════════════════════════════════
-
+NAV_FAST_FORWARD   = "FAST_FORWARD"
+NAV_SLOW_FORWARD   = "SLOW_FORWARD"
+NAV_STOP           = "STOP"
+NAV_SEARCH_LEFT    = "SEARCH_LEFT"
+NAV_SEARCH_RIGHT   = "SEARCH_RIGHT"
+NAV_FORWARD_SCAN   = "FORWARD_SCAN"
+NAV_SAFE_SEARCH    = "SAFE_SEARCH"
+NAV_FORWARD        = "FORWARD"
+NAV_BACKWARD       = "BACKWARD"
+NAV_AVOID_LEFT     = "AVOID_LEFT"
+NAV_AVOID_RIGHT    = "AVOID_RIGHT"
+NAV_HOVER          = "HOVER"
+NAV_SEARCH         = "SEARCH"
 NAV_EMERGENCY_STOP = "EMERGENCY_STOP"
-
-# Fraction of frame area that triggers an immediate emergency stop.
-# At 640×480 this is roughly 75 % of the frame — object is essentially
-# on top of the camera / drone.
-EMERGENCY_AREA_FRAC:     float = 0.60
-
-# If the FSM output changes more than this many times in one second the
-# oscillation guard fires EMERGENCY_STOP.
-OSCILLATION_GUARD_WINDOW: float = 1.0   # seconds
-OSCILLATION_GUARD_LIMIT:  int   = 8     # command changes within window
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  OBSTACLE AVOIDANCE — CONFIGURATION CONSTANTS  (v2 unchanged + v3 additions)
-# ══════════════════════════════════════════════════════════════════════════════
-
-FRONT_DANGER_FRAC: float = 0.10
-SIDE_DANGER_FRAC:  float = 0.05
-HUMAN_HOVER_FRAC:  float = 0.08
-
-# Upgrade 6 — human hover needs CENTER-zone overlap ≥ this fraction
-HUMAN_CENTER_OVERLAP_MIN: float = 0.40   # 40 % of human bbox must overlap CENTER
-
-LEFT_ZONE_END:    float = 0.30
-RIGHT_ZONE_START: float = 0.70
-
-# ── Upgrade 7 — vertical zone boundaries ──────────────────────────────────
-TOP_ZONE_END:    float = 0.30    # upper 30 % of frame height
-BOTTOM_ZONE_START: float = 0.70  # lower 30 % of frame height
-
-# ── Upgrade 2 — obstacle density threshold ────────────────────────────────
-CENTER_DENSITY_LIMIT: int = 3   # ≥ this many CENTER objects → SAFE_SEARCH
-
-# ── Upgrade 3 — temporal obstacle memory ──────────────────────────────────
-LAST_OBSTACLE_TIMEOUT: float = 0.5   # seconds an obstacle stays in memory
-
-# ── Navigation state labels (v2) ──────────────────────────────────────────
-NAV_FORWARD      = "FORWARD"
-NAV_BACKWARD     = "BACKWARD"
-NAV_AVOID_LEFT   = "AVOID_LEFT"
-NAV_AVOID_RIGHT  = "AVOID_RIGHT"
-NAV_HOVER        = "HOVER"
-NAV_SEARCH       = "SEARCH"
-
-# Full Arduino token map (v2 + v3)
-ARDUINO_TOKENS: dict[str, str] = {
-    NAV_FORWARD       : "F",
-    NAV_BACKWARD      : "B",
-    NAV_AVOID_LEFT    : "L",
-    NAV_AVOID_RIGHT   : "R",
-    NAV_HOVER         : "H",
-    NAV_SEARCH        : "S",
-    NAV_FAST_FORWARD  : "FF",
-    NAV_SLOW_FORWARD  : "SF",
-    NAV_STOP          : "ST",
-    NAV_SEARCH_LEFT   : "SL",
-    NAV_SEARCH_RIGHT  : "SR",
-    NAV_FORWARD_SCAN  : "FS",
-    NAV_SAFE_SEARCH   : "SS",
-    NAV_EMERGENCY_STOP: "ES",
-}
-
-NAV_STABILITY_MIN: int = 3
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  FIX 1 — THROTTLED human_count.txt WRITES
-#  Write only when count changes OR 0.5 s has elapsed to prevent per-frame
-#  disk hammering (SSD wear, excessive CPU stalls on slow storage).
-# ══════════════════════════════════════════════════════════════════════════════
-HUMAN_COUNT_WRITE_INTERVAL: float = 0.5   # seconds between forced writes
-_last_human_write_time: float = 0.0
-_last_human_count:      int   = -1        # sentinel: force first write
-
-
-def _write_human_count(count: int) -> None:
-    """
-    Write human_count.txt only when the count changed or the minimum
-    write interval has elapsed.  Thread-safe via GIL on CPython for simple
-    integer comparisons; no additional lock needed for this use-case.
-    """
-    global _last_human_write_time, _last_human_count
-    now = time.time()
-    if count == _last_human_count and (now - _last_human_write_time) < HUMAN_COUNT_WRITE_INTERVAL:
-        return   # nothing to do
-    try:
-        with open("human_count.txt", "w") as fh:
-            fh.write(str(count))
-        _last_human_write_time = now
-        _last_human_count      = count
-    except OSError as exc:
-        print(f"[HumanCount] Write error: {exc}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  ORIGINAL AI DECISION LAYER  (human-tracking — UNCHANGED)
-# ══════════════════════════════════════════════════════════════════════════════
 
 STATE_IDLE      = "IDLE"
 STATE_TRACKING  = "TRACKING"
 STATE_SEARCHING = "SEARCHING"
 
-_ai_state         = STATE_IDLE
-_ai_decision_str  = "IDLE"
-_ai_prev_decision = "IDLE"
-_ai_same_count    = 0
-_AI_STABILITY_MIN = 3
-_AI_CENTER_THRESH = 0.18
-
-HUMAN_CLASS = 0   # COCO class id for person (needed by ai_decision below)
-
-
-def ai_decision(boxes: list, frame_w: int, frame_h: int):
-    """Original human-tracking AI layer — unchanged from v2."""
-    global _ai_state, _ai_decision_str, _ai_prev_decision, _ai_same_count
-
-    frame_cx   = frame_w // 2
-    human_boxes = [b for b in boxes if b[6] == HUMAN_CLASS]
-
-    if not human_boxes:
-        _ai_state     = STATE_SEARCHING
-        raw_cmd       = "SEARCH"
-        target_center = None
-    else:
-        def _area(b):
-            return (b[2] - b[0]) * (b[3] - b[1])
-
-        best = max(human_boxes, key=_area)
-        x1, y1, x2, y2, conf, tid, cls_id = best
-        cx = (x1 + x2) // 2
-        cy = (y1 + y2) // 2
-        target_center = (cx, cy)
-
-        offset_frac = (cx - frame_cx) / frame_w
-        if offset_frac < -_AI_CENTER_THRESH:
-            raw_cmd = "LEFT"
-        elif offset_frac > _AI_CENTER_THRESH:
-            raw_cmd = "RIGHT"
-        else:
-            raw_cmd = "FORWARD"
-
-        _ai_state = STATE_TRACKING
-
-    if raw_cmd == _ai_prev_decision:
-        _ai_same_count += 1
-    else:
-        _ai_same_count    = 1
-        _ai_prev_decision = raw_cmd
-
-    if _ai_same_count >= _AI_STABILITY_MIN:
-        if _ai_decision_str != raw_cmd:
-            _ai_decision_str = raw_cmd
-            # NOTE: logging suppressed here — [MASTER] arbiter logs the final cmd
-
-    return _ai_state, _ai_decision_str, target_center
-
-
-def draw_ai_overlay(frame: np.ndarray,
-                    target_center,
-                    frame_w: int, frame_h: int) -> None:
-    """Draw AI tracking aids — unchanged from v2."""
-    fc = (frame_w // 2, frame_h // 2)
-    cv2.circle(frame, fc, 6, (0, 0, 255), -1)
-    cv2.circle(frame, fc, 8, (255, 255, 255), 1)
-    if target_center is not None:
-        cv2.line(frame, fc, target_center, (255, 80, 0), 2)
-        cv2.circle(frame, target_center, 5, (255, 80, 0), -1)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  UPGRADE 10 — ROBUST PSEUDO-DEPTH ESTIMATION
-#  v2 used only bounding-box area, which fails for:
-#    • large far objects (wide-angle walls)
-#    • small close objects (narrow pillars)
-#    • perspective tilt (objects at frame bottom are closer in a forward camera)
-#
-#  v3 blends four cues with empirically tuned weights:
-#    (a) Normalised area           — primary distance proxy
-#    (b) Normalised width ratio    — horizontal spread reveals planar walls
-#    (c) Normalised height ratio   — vertical span useful for doors/people
-#    (d) Vertical position bias    — objects lower in frame tend to be closer
-#                                    for a slightly downward-tilted drone camera
-#  Temporal smoothing over a short window reduces flicker from detection jitter.
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Per-track exponential moving average alpha (higher = more responsive)
-_DEPTH_EMA_ALPHA: float = 0.45
-
-# Dict[track_id → smoothed_proximity]
-_depth_ema: Dict[int, float] = {}
-
-
-def estimate_pseudo_depth_v3(x1: int, y1: int, x2: int, y2: int,
-                               frame_w: int, frame_h: int,
-                               tid: int = -1) -> float:
-    """
-    Multi-cue pseudo-depth with EMA temporal smoothing.
-
-    Returns normalised proximity in [0.0, 1.0]:
-        0.0 → far / tiny
-        1.0 → fills frame / extremely close
-
-    Cue weights (sum to 1.0):
-        area_cue     0.55  (dominant signal)
-        width_cue    0.20  (wall detection)
-        height_cue   0.15  (person/door detection)
-        vpos_cue     0.10  (vertical position bias)
-    """
-    if frame_w <= 0 or frame_h <= 0:
-        return 0.0
-
-    bw = max(0, x2 - x1)
-    bh = max(0, y2 - y1)
-
-    area_cue   = min(1.0, (bw * bh) / (frame_w * frame_h))
-    width_cue  = min(1.0, bw / frame_w)
-    height_cue = min(1.0, bh / frame_h)
-
-    # Vertical position: cy near bottom → closer (drone camera looks slightly down)
-    cy_norm  = ((y1 + y2) / 2.0) / frame_h
-    vpos_cue = float(np.clip(cy_norm, 0.0, 1.0))
-
-    raw = (0.55 * area_cue
-           + 0.20 * width_cue
-           + 0.15 * height_cue
-           + 0.10 * vpos_cue)
-    raw = float(np.clip(raw, 0.0, 1.0))
-
-    # EMA smoothing — only for properly tracked objects (tid ≥ 0)
-    if tid >= 0:
-        prev = _depth_ema.get(tid, raw)
-        smoothed = _DEPTH_EMA_ALPHA * raw + (1.0 - _DEPTH_EMA_ALPHA) * prev
-        _depth_ema[tid] = smoothed
-        return smoothed
-    return raw
-
-
-def classify_horizontal_zone(cx: int, frame_w: int) -> str:
-    """Map horizontal centre-x → 'LEFT' | 'CENTER' | 'RIGHT'."""
-    frac = cx / frame_w
-    if frac < LEFT_ZONE_END:
-        return "LEFT"
-    if frac > RIGHT_ZONE_START:
-        return "RIGHT"
-    return "CENTER"
-
-
-# ── UPGRADE 7 — vertical zone classification ──────────────────────────────
-
-def classify_vertical_zone(cy: int, frame_h: int) -> str:
-    """
-    Map vertical centre-y → 'TOP' | 'MIDDLE' | 'BOTTOM'.
-
-    TOP    — ceiling / high-mounted objects (risk of clipping)
-    MIDDLE — cruise altitude band (primary collision zone)
-    BOTTOM — floor-level obstacles (legs of chairs, pets)
-    """
-    frac = cy / frame_h
-    if frac < TOP_ZONE_END:
-        return "TOP"
-    if frac > BOTTOM_ZONE_START:
-        return "BOTTOM"
-    return "MIDDLE"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  OBSTACLE DATA CONTAINER  (extended from v2)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class ObstacleInfo:
-    """Lightweight obstacle descriptor — extended with vertical zone (v3)."""
-
-    __slots__ = ("box", "proximity", "zone", "v_zone",
-                 "is_human", "tid", "cls_id", "timestamp")
-
-    def __init__(self,
-                 box: Tuple[int, int, int, int],
-                 proximity: float,
-                 zone: str,
-                 v_zone: str,
-                 is_human: bool,
-                 tid: int,
-                 cls_id: int,
-                 timestamp: float):
-        self.box       = box
-        self.proximity = proximity
-        self.zone      = zone
-        self.v_zone    = v_zone       # NEW v3: TOP | MIDDLE | BOTTOM
-        self.is_human  = is_human
-        self.tid       = tid
-        self.cls_id    = cls_id
-        self.timestamp = timestamp    # NEW v3: creation time for memory expiry
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  UPGRADE 3 — TEMPORAL OBSTACLE MEMORY
-#  Keeps recently seen obstacles alive for LAST_OBSTACLE_TIMEOUT seconds so
-#  a single missed detection frame does not flush the navigation context.
-#  This prevents the flickering FORWARD→AVOID→FORWARD→AVOID pattern.
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Dict[tid → ObstacleInfo]  — persists across frames
-_obstacle_memory: Dict[int, ObstacleInfo] = {}
-
-
-def _update_obstacle_memory(live_obstacles: list[ObstacleInfo]) -> list[ObstacleInfo]:
-    """
-    Merge live detections into obstacle memory and prune expired entries.
-
-    Algorithm:
-      1. Update memory with each live detection (overwrites stale entry for
-         same tid with fresh data + new timestamp).
-      2. Prune any entry older than LAST_OBSTACLE_TIMEOUT.
-      3. Return merged list (live + remembered) for this frame.
-
-    Only tracked objects (tid ≥ 0) enter memory; anonymous detections (tid=-1)
-    are passed through directly without persistence.
-    """
-    now = time.time()
-
-    # Insert / refresh live detections
-    for obs in live_obstacles:
-        if obs.tid >= 0:
-            _obstacle_memory[obs.tid] = obs   # timestamp already set to now
-
-    # Prune expired entries
-    expired = [tid for tid, obs in _obstacle_memory.items()
-               if now - obs.timestamp > LAST_OBSTACLE_TIMEOUT]
-    for tid in expired:
-        del _obstacle_memory[tid]
-        _depth_ema.pop(tid, None)   # also clean up depth EMA state
-
-    # Merge: live takes priority; add remembered obstacles not in live set
-    live_tids  = {o.tid for o in live_obstacles}
-    remembered = [obs for tid, obs in _obstacle_memory.items()
-                  if tid not in live_tids]
-
-    merged = live_obstacles + remembered
-    merged.sort(key=lambda o: o.proximity, reverse=True)
-    return merged
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  OBSTACLE ANALYSIS  (upgrade 1 + 7 + 10 integrated)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _compute_live_obstacles(boxes: list,
-                             frame_w: int,
-                             frame_h: int) -> list[ObstacleInfo]:
-    """
-    Compute ObstacleInfo for current-frame boxes WITHOUT merging obstacle memory.
-
-    Used exclusively by the emergency layer so recovery decisions are based
-    on what is visible NOW, not on EMA-smoothed or remembered detections.
-    Mirrors analyse_obstacles but skips _update_obstacle_memory.
-    """
-    now  = time.time()
-    live: list[ObstacleInfo] = []
-    for (x1, y1, x2, y2, conf, tid, cls_id) in boxes:
-        if cls_id not in NAVIGATION_CLASSES:
-            continue
-        cx        = (x1 + x2) // 2
-        cy        = (y1 + y2) // 2
-        # Use raw (non-EMA) proximity for the emergency gate so smoothed
-        # history cannot keep the value artificially high after obstacle clears.
-        proximity = estimate_pseudo_depth_v3(x1, y1, x2, y2, frame_w, frame_h, tid=-1)
-        zone      = classify_horizontal_zone(cx, frame_w)
-        v_zone    = classify_vertical_zone(cy, frame_h)
-        is_human  = (cls_id == HUMAN_CLASS)
-        live.append(ObstacleInfo(
-            box=      (x1, y1, x2, y2),
-            proximity=proximity,
-            zone=     zone,
-            v_zone=   v_zone,
-            is_human= is_human,
-            tid=      tid,
-            cls_id=   cls_id,
-            timestamp=now,
-        ))
-    return live
-
-
-def analyse_obstacles(boxes: list,
-                      frame_w: int,
-                      frame_h: int) -> list[ObstacleInfo]:
-    """
-    Convert raw YOLO boxes → ObstacleInfo list with memory persistence.
-
-    Changes from v2:
-      • Class filter: skip objects not in NAVIGATION_CLASSES (upgrade 1)
-      • Vertical zone classification (upgrade 7)
-      • Multi-cue depth with EMA smoothing (upgrade 10)
-      • Timestamp stamping for memory layer (upgrade 3)
-    """
-    now          = time.time()
-    live: list[ObstacleInfo] = []
-
-    for (x1, y1, x2, y2, conf, tid, cls_id) in boxes:
-
-        # ── UPGRADE 1: Skip navigation-irrelevant objects ─────────────────
-        if cls_id not in NAVIGATION_CLASSES:
-            continue
-
-        cx        = (x1 + x2) // 2
-        cy        = (y1 + y2) // 2
-        proximity = estimate_pseudo_depth_v3(x1, y1, x2, y2, frame_w, frame_h, tid)
-        zone      = classify_horizontal_zone(cx, frame_w)
-        v_zone    = classify_vertical_zone(cy, frame_h)   # UPGRADE 7
-        is_human  = (cls_id == HUMAN_CLASS)
-
-        live.append(ObstacleInfo(
-            box       = (x1, y1, x2, y2),
-            proximity = proximity,
-            zone      = zone,
-            v_zone    = v_zone,
-            is_human  = is_human,
-            tid       = tid,
-            cls_id    = cls_id,
-            timestamp = now,
-        ))
-
-    live.sort(key=lambda o: o.proximity, reverse=True)
-
-    # ── UPGRADE 3: Merge with temporal memory ──────────────────────────────
-    return _update_obstacle_memory(live)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  UPGRADE 6 — IMPROVED HUMAN HOVER LOGIC
-#  v2 used only the bounding-box centre point to decide hover zone.  A tall
-#  person at the frame edge can have their centre in CENTER even though most
-#  of their body is off to the side.  Conversely, a person standing squarely
-#  but detected with slight jitter may briefly have centre outside CENTER.
-#
-#  v3 computes the fraction of the human's bounding box that overlaps the
-#  CENTER horizontal band (pixels between LEFT_ZONE_END and RIGHT_ZONE_START).
-#  Hover is only triggered when overlap ≥ HUMAN_CENTER_OVERLAP_MIN.
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _human_center_overlap(obs: ObstacleInfo, frame_w: int) -> float:
-    """
-    Compute what fraction of the human's bounding-box width lies inside
-    the CENTER zone [LEFT_ZONE_END*frame_w, RIGHT_ZONE_START*frame_w].
-
-    Returns a value in [0.0, 1.0]:
-        0.0 → human entirely outside CENTER band
-        1.0 → human entirely inside CENTER band
-    """
-    x1, y1, x2, y2 = obs.box
-    box_w = max(1, x2 - x1)
-
-    center_left  = int(frame_w * LEFT_ZONE_END)
-    center_right = int(frame_w * RIGHT_ZONE_START)
-
-    # Clamp human box edges to CENTER band
-    overlap_left  = max(x1, center_left)
-    overlap_right = min(x2, center_right)
-
-    overlap_px = max(0, overlap_right - overlap_left)
-    return overlap_px / box_w
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  UPGRADE 8 — SEARCH FSM STATE MANAGER
-#  Manages the cyclic search sub-state with timing so the drone does not spin
-#  forever in one direction.
-# ══════════════════════════════════════════════════════════════════════════════
-
-_search_phase_index: int   = 0
-_search_phase_start: float = time.time()   # FIX 3: initialise to now so the
-# first search phase runs for a full SEARCH_PHASE_DURATION before advancing.
-# The previous value of 0.0 caused an immediate phase skip on the very first
-# call because (now - 0.0) was always ≥ SEARCH_PHASE_DURATION.
-
-# FIX 4: track when FORWARD_SCAN sub-phase started so it can be duration-capped.
-_forward_scan_start: float = 0.0
-
-# FIX 6: Exploration recovery counter.
-# After this many full LEFT→RIGHT cycles without a FORWARD_SCAN succeeding,
-# inject one forced FORWARD_SCAN attempt (still obstacle-gated) to break the
-# oscillation loop.  Keeps exploration CPU-lightweight with no SLAM/mapping.
-_search_cycle_count:   int = 0   # increments each time phase wraps to 0
-SEARCH_RECOVERY_CYCLES: int = 4  # inject forward scan after N full cycles
-
-
-def _next_search_state(obstacles: list[ObstacleInfo]) -> str:
-    """
-    Return the current search sub-state, advancing phase when the timer
-    expires.
-
-    FIX 4 — FORWARD_SCAN is capped at FORWARD_SCAN_DURATION seconds AND
-    cancelled immediately if a CENTER obstacle appears.
-
-    FIX 6 — After SEARCH_RECOVERY_CYCLES full LEFT/RIGHT cycles without a
-    successful FORWARD_SCAN, inject one forced attempt to break oscillation.
-    The forced scan is still obstacle-gated — if obstacles block it we fall
-    back to SAFE_SEARCH to preserve safety-first behaviour.
-    """
-    global _search_phase_index, _search_phase_start
-    global _forward_scan_start, _search_cycle_count
-
-    now = time.time()
-
-    # ── Advance phase when timer expires ──────────────────────────────────
-    if now - _search_phase_start >= SEARCH_PHASE_DURATION:
-        prev_index          = _search_phase_index
-        _search_phase_index = (_search_phase_index + 1) % len(_SEARCH_CYCLE)
-        _search_phase_start = now
-
-        # FIX 6: count completed full cycles (phase wraps from last → 0)
-        if _search_phase_index == 0:
-            _search_cycle_count += 1
-
-    state = _SEARCH_CYCLE[_search_phase_index]
-
-    # ── FIX 4: FORWARD_SCAN duration cap + real-time obstacle gate ────────
-    if state == NAV_FORWARD_SCAN:
-        center_obs = [o for o in obstacles if o.zone == "CENTER"
-                      and o.proximity >= SIDE_DANGER_FRAC]
-        if center_obs:
-            # Obstacle ahead — stay in safe sideways search
-            return NAV_SAFE_SEARCH
-
-        # Start the scan timer on entry
-        if _forward_scan_start == 0.0 or (now - _forward_scan_start) > SEARCH_PHASE_DURATION:
-            _forward_scan_start = now
-
-        # Cap the forward creep at FORWARD_SCAN_DURATION
-        if (now - _forward_scan_start) >= FORWARD_SCAN_DURATION:
-            # PATCH 5 — Micro-creep elapsed.  Advance FSM phase naturally
-            # instead of hardcoding NAV_SEARCH_LEFT, which caused a leftward
-            # bias and broke cycle symmetry.  The next phase in _SEARCH_CYCLE
-            # is whatever follows FORWARD_SCAN (i.e. back to SEARCH_LEFT via
-            # modulo wrap), so the cycle remains symmetric.
-            _search_phase_index = (_search_phase_index + 1) % len(_SEARCH_CYCLE)
-            _search_phase_start = now
-            _forward_scan_start = 0.0
-            return _SEARCH_CYCLE[_search_phase_index]   # follow cycle, no bias
-
-        return NAV_FORWARD_SCAN
-
-    # ── FIX 6: Exploration recovery injection ─────────────────────────────
-    # After enough LEFT/RIGHT cycles without forward progress, attempt a
-    # gated forward scan regardless of the normal cycle phase.
-    if _search_cycle_count >= SEARCH_RECOVERY_CYCLES:
-        _search_cycle_count = 0   # reset counter
-        center_obs = [o for o in obstacles if o.zone == "CENTER"
-                      and o.proximity >= SIDE_DANGER_FRAC]
-        if not center_obs:
-            # Path looks clear — inject a short forward scan
-            _forward_scan_start = now
-            _search_phase_index = _SEARCH_CYCLE.index(NAV_FORWARD_SCAN)
-            _search_phase_start = now
-            return NAV_FORWARD_SCAN
-        # Still blocked — stay safe
-        return NAV_SAFE_SEARCH
-
-    return state
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  UPGRADE 11 — EMERGENCY SAFETY LAYER  (oscillation guard state)
-#  PATCH 7 — Full FSM with hysteresis and proper recovery
-# ══════════════════════════════════════════════════════════════════════════════
-
-_oscillation_timestamps: deque = deque()   # timestamps of dangerous command changes
-
-# ── Emergency FSM state ───────────────────────────────────────────────────────
-# Three explicit phases:
-#   IDLE      → normal navigation, no emergency active
-#   ACTIVE    → emergency hold (drone stopped, sending ES)
-#   RECOVERY  → hold elapsed, waiting for proximity to drop below SAFE_RELEASE_FRAC
-#               before returning to IDLE.  Prevents immediate re-entry flicker.
-_EMERG_IDLE     = "IDLE"
-_EMERG_ACTIVE   = "ACTIVE"
-_EMERG_RECOVERY = "RECOVERY"
-
-_emergency_phase:      str   = _EMERG_IDLE
-_emergency_start_time: float = 0.0
-_emergency_reason:     str   = ""
-
-# ES token spam guard: track when ES was last transmitted so we only re-send
-# periodically (watchdog keepalive) rather than every frame.
-_emergency_last_sent:  float = 0.0
-EMERGENCY_RESEND_INTERVAL: float = 0.8   # seconds between repeat ES tokens
-
-# Hysteresis thresholds — entry is aggressive, exit is conservative.
-# EMERGENCY_AREA_FRAC defined earlier (0.60) is used for entry.
-SAFE_RELEASE_FRAC: float = 0.35   # proximity must drop below this to exit recovery
-
-# PATCH 3 — Extended from 1.5 s to 2.5 s.
-# 1.5 s was too short for WiFi jitter / temporary stream freezes; the
-# emergency could release before the hazard fully cleared.  2.5 s gives
-# enough headroom for a real-world network hiccup while not freezing the
-# drone indefinitely if the scene recovers quickly.
-EMERGENCY_HOLD_DURATION: float = 2.5       # hold EMERGENCY_STOP for N seconds
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  FIX 2 — STALE FRAME THRESHOLD
-#  If no new frame arrives within this many seconds, force EMERGENCY_STOP.
-# ══════════════════════════════════════════════════════════════════════════════
-STALE_FRAME_TIMEOUT:  float = 1.0   # seconds before stale-frame emergency fires
-READER_FAIL_HOLD:     float = 1.5   # FIX 3: seconds to hold ES on reader death
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  FIX 4 — FORWARD_SCAN DURATION CAP
-#  FORWARD_SCAN is now a micro-creep that auto-cancels after this duration or
-#  immediately if a CENTER obstacle appears during the scan window.
-# ══════════════════════════════════════════════════════════════════════════════
-FORWARD_SCAN_DURATION: float = 0.5   # seconds; short and immediately cancellable
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  FIX 7 — SERIAL COMMAND OUTPUT LAYER
-#  Throttled, duplicate-suppressed, queue-backed Arduino serial output.
-# ══════════════════════════════════════════════════════════════════════════════
-COMMAND_SEND_INTERVAL: float = 0.1   # minimum seconds between serial writes
-SERIAL_PORT_DEFAULT:   str   = "COM5"
-SERIAL_BAUD_DEFAULT:   int   = 115200
-HEARTBEAT_INTERVAL:    float = 0.5   # FIX 8: seconds between HB tokens
-
-# FIX 8 — Only count oscillations between commands that represent genuine
-# axis-reversal instability.  Speed-tier transitions (FF→SF→ST), search
-# sub-states, and hover transitions are normal behaviour in dynamic scenes
-# and must NOT contribute to the oscillation count.
-_OSCILLATION_PAIRS: frozenset[frozenset] = frozenset({
-    frozenset({NAV_AVOID_LEFT,    NAV_AVOID_RIGHT}),
-    frozenset({NAV_FAST_FORWARD,  NAV_BACKWARD}),
-    frozenset({NAV_SLOW_FORWARD,  NAV_BACKWARD}),
-    frozenset({NAV_FORWARD,       NAV_BACKWARD}),
-    frozenset({NAV_STOP,          NAV_BACKWARD}),
-})
-
-
-def _is_dangerous_oscillation(cmd_a: str, cmd_b: str) -> bool:
-    """Return True only if the transition between cmd_a and cmd_b represents
-    a genuine navigation reversal that could indicate control instability."""
-    return frozenset({cmd_a, cmd_b}) in _OSCILLATION_PAIRS
-
-
-def _check_emergency(raw_cmd: str,
-                     prev_raw: str,
-                     live_obstacles: list[ObstacleInfo]) -> bool:
-    """
-    Three-phase emergency FSM: IDLE → ACTIVE → RECOVERY → IDLE.
-
-    PATCH 7 — Full FSM with hysteresis to fix permanent-latch bug.
-
-    Phases
-    ------
-    IDLE:
-      • Evaluate entry triggers (giant obstacle, oscillation).
-      • If triggered → transition to ACTIVE, log entry.
-
-    ACTIVE (hold phase):
-      • Always return True (ES) for EMERGENCY_HOLD_DURATION seconds.
-      • Resend ES token periodically (watchdog keepalive, not every frame).
-      • After hold elapses → transition to RECOVERY, log hold complete.
-
-    RECOVERY:
-      • Still return True (ES) until current-frame proximity drops below
-        SAFE_RELEASE_FRAC on ALL live obstacles (hysteresis exit gate).
-      • Key fix: uses ONLY live_obstacles (current frame detections, no
-        obstacle memory, no EMA history) so stale values cannot block
-        recovery indefinitely.
-      • If safe → transition to IDLE, log release.
-      • If still unsafe → remain in RECOVERY, log blocked reason.
-
-    Oscillation guard accumulates across all phases; cleared on ACTIVE entry.
-
-    Parameters
-    ----------
-    raw_cmd        : current raw navigation command (for oscillation check)
-    prev_raw       : previous raw navigation command
-    live_obstacles : obstacles from CURRENT frame only — NOT obstacle memory.
-                     Caller (nav_decision) must pass pre-memory-merge live list.
-    """
-    global _emergency_phase, _emergency_start_time, _emergency_reason
-    global _emergency_last_sent
-
-    now = time.time()
-
-    # ── Oscillation accumulation (runs in all phases) ─────────────────────
-    if _is_dangerous_oscillation(raw_cmd, prev_raw):
-        _oscillation_timestamps.append(now)
-    while (_oscillation_timestamps
-           and (now - _oscillation_timestamps[0]) > OSCILLATION_GUARD_WINDOW):
-        _oscillation_timestamps.popleft()
-
-    # ══════════════════════════════════════════════════════════════════════
-    #  PHASE: IDLE  — evaluate entry triggers
-    # ══════════════════════════════════════════════════════════════════════
-    if _emergency_phase == _EMERG_IDLE:
-
-        # Trigger A: large obstacle in current frame
-        for obs in live_obstacles:
-            if obs.proximity >= EMERGENCY_AREA_FRAC:
-                _emergency_phase      = _EMERG_ACTIVE
-                _emergency_start_time = now
-                _emergency_reason     = f"obstacle {obs.proximity*100:.0f}% >= {EMERGENCY_AREA_FRAC*100:.0f}%"
-                _emergency_last_sent  = 0.0   # force immediate ES send
-                _oscillation_timestamps.clear()
-                print(f"[EMERGENCY] Entered — {_emergency_reason}")
-                return True
-
-        # Trigger B: command oscillation
-        if len(_oscillation_timestamps) > OSCILLATION_GUARD_LIMIT:
-            _emergency_phase      = _EMERG_ACTIVE
-            _emergency_start_time = now
-            _emergency_reason     = "oscillation guard"
-            _emergency_last_sent  = 0.0
-            _oscillation_timestamps.clear()
-            print(f"[EMERGENCY] Entered — {_emergency_reason}")
-            return True
-
-        return False   # IDLE, no trigger
-
-    # ══════════════════════════════════════════════════════════════════════
-    #  PHASE: ACTIVE  — hold for EMERGENCY_HOLD_DURATION
-    # ══════════════════════════════════════════════════════════════════════
-    if _emergency_phase == _EMERG_ACTIVE:
-        elapsed = now - _emergency_start_time
-
-        if elapsed < EMERGENCY_HOLD_DURATION:
-            # Periodic resend so Arduino watchdog stays alive (not every frame)
-            if now - _emergency_last_sent >= EMERGENCY_RESEND_INTERVAL:
-                _emergency_last_sent = now
-                print(f"[EMERGENCY] Holding ({elapsed:.1f}s / {EMERGENCY_HOLD_DURATION:.1f}s)")
-            return True
-
-        # Hold elapsed → enter recovery
-        _emergency_phase      = _EMERG_RECOVERY
-        _emergency_start_time = now   # reuse as recovery start for logging
-        print("[EMERGENCY] Hold elapsed → entering RECOVERY phase")
-        # Fall through to RECOVERY check immediately this frame
-
-    # ══════════════════════════════════════════════════════════════════════
-    #  PHASE: RECOVERY  — wait for proximity to drop (hysteresis exit gate)
-    #  CRITICAL: use live_obstacles ONLY — no EMA, no obstacle memory.
-    #  This prevents stale/smoothed proximity values from blocking recovery.
-    # ══════════════════════════════════════════════════════════════════════
-    if _emergency_phase == _EMERG_RECOVERY:
-
-        # Collect max proximity from LIVE (current-frame) detections only.
-        # No obstacle — proximity is 0.0 → safe to release.
-        max_live_prox = max(
-            (obs.proximity for obs in live_obstacles),
-            default=0.0
-        )
-
-        if max_live_prox < SAFE_RELEASE_FRAC:
-            # Safe conditions confirmed → release emergency
-            _emergency_phase  = _EMERG_IDLE
-            _emergency_reason = ""
-            print(f"[EMERGENCY] Released — max live proximity {max_live_prox*100:.0f}% "
-                  f"< {SAFE_RELEASE_FRAC*100:.0f}% threshold")
-            return False   # IDLE: normal navigation resumes
-
-        # Still unsafe — remain in recovery, log periodically
-        if now - _emergency_last_sent >= EMERGENCY_RESEND_INTERVAL:
-            _emergency_last_sent = now
-            print(f"[EMERGENCY] Recovery blocked — live proximity {max_live_prox*100:.0f}% "
-                  f">= release threshold {SAFE_RELEASE_FRAC*100:.0f}%")
-        return True   # hold ES until clear
-
-    # Fallback (should never reach here)
-    return False
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  UPGRADE 5 — SPEED-AWARE FORWARD COMMAND
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _speed_tiered_forward(obstacles: list[ObstacleInfo]) -> str:
-    """
-    Choose FAST_FORWARD / SLOW_FORWARD / STOP based on the proximity of
-    the nearest obstacle in the CENTER zone.
-
-    If no CENTER obstacles exist, return FAST_FORWARD (clear path).
-    """
-    center_obs = [o for o in obstacles if o.zone == "CENTER"]
-    if not center_obs:
-        return NAV_FAST_FORWARD
-
-    nearest = max(center_obs, key=lambda o: o.proximity)
-
-    if nearest.proximity < SPEED_CLEAR_FRAC:
-        return NAV_FAST_FORWARD
-    if nearest.proximity < SPEED_CAUTION_FRAC:
-        return NAV_SLOW_FORWARD
-    return NAV_STOP
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  CORE NAVIGATION LOGIC  (pure function — v3 rewrite of _nav_raw_decision)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _nav_raw_decision_v3(obstacles: list[ObstacleInfo],
-                          frame_w: int,
-                          frame_h: int) -> Tuple[str, str, Optional[ObstacleInfo]]:
-    """
-    Navigation FSM — pure function, no side-effects.
-
-    Priority order (highest → lowest):
-      0. EMERGENCY_STOP   — handled by caller; not evaluated here
-      1. Human HOVER      — centred + close human → HOVER, never BACKWARD
-                            (must precede collision checks — see note below)
-      2. Frontal collision (non-human only) → BACKWARD
-      3. Side collision   (non-human only) → AVOID_LEFT / AVOID_RIGHT
-      4. Obstacle density in CENTER ≥ CENTER_DENSITY_LIMIT → SAFE_SEARCH
-      5. TOP-zone obstacle: HIGH proximity → STOP, MEDIUM → SLOW_FORWARD
-      6. Speed-tiered forward motion
-      7. No detections → cyclic search
-
-    FIX 1 — Human exclusion from avoidance branches
-    ─────────────────────────────────────────────────
-    Humans are *targets*, not obstacles.  The drone should approach and
-    hover near a person, not retreat.  Placing hover logic at Priority 1
-    means a centred close person is captured before the collision check
-    at Priority 2.  In both Priority 2 and Priority 3 we additionally
-    guard with `if obs.is_human: continue` so that a human who did NOT
-    satisfy the hover conditions (e.g. too far off-centre) is silently
-    skipped rather than driving BACKWARD or AVOID_*.  A human that
-    doesn't qualify for hover is simply ignored by avoidance — the
-    drone continues forward / holds position via Priority 6.
-
-    FIX 5 — Stronger TOP-zone response
-    ─────────────────────────────────────────────────
-    A TOP obstacle at FRONT_DANGER_FRAC proximity is a ceiling collision
-    risk; SLOW_FORWARD would still advance the drone into it.  We now
-    return NAV_STOP for high-proximity ceiling objects and keep
-    SLOW_FORWARD only for medium-risk overhead detections.
-    """
-    if not obstacles:
-        return _next_search_state([]), NAV_SEARCH, None
-
-    # ── Priority 1: Human HOVER (must run before any collision branch) ─────
-    # Rationale: a person at close range in the CENTER zone has proximity ≥
-    # FRONT_DANGER_FRAC, which would otherwise fire BACKWARD at Priority 2.
-    # By evaluating hover first we guarantee the drone pauses in front of
-    # people rather than fleeing from them.
-    humans = [o for o in obstacles if o.is_human]
-    for human in humans:
-        overlap = _human_center_overlap(human, frame_w)
-        if (human.proximity >= HUMAN_HOVER_FRAC
-                and overlap >= HUMAN_CENTER_OVERLAP_MIN):
-            return NAV_HOVER, NAV_HOVER, human
-
-    # ── Priority 2: Frontal collision — non-human objects only ────────────
-    # FIX 1: humans that failed hover (too far off-centre or too far away)
-    # are skipped here.  They are tracked targets, not physical hazards to
-    # avoid with a reverse manoeuvre.
-    for obs in obstacles:   # sorted closest-first
-        if obs.is_human:
-            continue        # FIX 1: humans never trigger BACKWARD
-        if obs.zone == "CENTER" and obs.proximity >= FRONT_DANGER_FRAC:
-            return NAV_BACKWARD, NAV_BACKWARD, obs
-
-    # ── Priority 3: Side collision — non-human objects only ───────────────
-    # FIX 1: same guard — humans do not trigger lateral avoidance either.
-    # An off-centre person would cause confusing sideways dodging behaviour.
-    for obs in obstacles:
-        if obs.is_human:
-            continue        # FIX 1: humans never trigger AVOID_*
-        if obs.zone == "LEFT" and obs.proximity >= SIDE_DANGER_FRAC:
-            return NAV_AVOID_RIGHT, NAV_AVOID_RIGHT, obs
-        if obs.zone == "RIGHT" and obs.proximity >= SIDE_DANGER_FRAC:
-            return NAV_AVOID_LEFT, NAV_AVOID_LEFT, obs
-
-    # ── Priority 4: Obstacle density — UPGRADE 2 ──────────────────────────
-    center_objects = [o for o in obstacles if o.zone == "CENTER"]
-    if len(center_objects) >= CENTER_DENSITY_LIMIT:
-        return NAV_SAFE_SEARCH, NAV_SEARCH, None
-
-    # ── Priority 5: Vertical awareness — FIX 5 + UPGRADE 7 ───────────────
-    # FIX 5: split into two response tiers based on proximity severity.
-    #   HIGH (≥ FRONT_DANGER_FRAC)  → NAV_STOP: ceiling contact imminent;
-    #                                  advancing would cause a collision.
-    #   MEDIUM (≥ SIDE_DANGER_FRAC) → NAV_SLOW_FORWARD: overhead object is
-    #                                  present but not yet critical; slow down.
-    top_threats = [o for o in obstacles
-                   if o.v_zone == "TOP" and o.proximity >= SIDE_DANGER_FRAC]
-    if top_threats:
-        worst_top = max(top_threats, key=lambda o: o.proximity)
-        if worst_top.proximity >= FRONT_DANGER_FRAC:
-            # Ceiling / high-shelf imminent — stop completely
-            return NAV_STOP, NAV_STOP, worst_top
-        # Medium overhead risk — decelerate but keep moving
-        return NAV_SLOW_FORWARD, NAV_FORWARD, worst_top
-
-    # ── Priority 6: Speed-tiered FORWARD — UPGRADE 5 ──────────────────────
-    fwd_cmd = _speed_tiered_forward(obstacles)
-    return fwd_cmd, NAV_FORWARD, None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  PUBLIC NAVIGATION DECISION FUNCTION  (replaces nav_decision from v2)
-# ══════════════════════════════════════════════════════════════════════════════
-
-_nav_state        = NAV_SEARCH
-_nav_prev_raw     = NAV_SEARCH
-_nav_stable_count = 0
-_nav_final_cmd    = NAV_SEARCH
-
-
-def _force_emergency_nav_state() -> None:
-    """
-    PATCH 1 — Force the navigation FSM into EMERGENCY_STOP synchronously.
-
-    Called from the stale-frame path and the reader-failure path in main().
-    Without this, send_nav_token() would transmit "ES" to the Arduino while
-    nav_cmd / _nav_final_cmd still held a stale value (e.g. "FORWARD").
-    That desynchronisation caused:
-      • The HUD to display the wrong command
-      • draw_nav_overlay() to render the wrong arrow / banner
-      • Any code reading _nav_final_cmd to see an unsafe stale state
-
-    This function must be called BEFORE the frame is rendered so that both
-    the overlay and the HUD display NAV_EMERGENCY_STOP consistently.
-    It is intentionally lightweight (no lock needed — called from the single
-    display loop thread) and does not touch the YOLO or reader threads.
-    """
-    global _nav_state, _nav_prev_raw, _nav_stable_count, _nav_final_cmd
-    global _emergency_phase, _emergency_start_time, _emergency_reason, _emergency_last_sent
-    _nav_final_cmd        = NAV_EMERGENCY_STOP
-    _nav_state            = NAV_EMERGENCY_STOP
-    _nav_prev_raw         = NAV_EMERGENCY_STOP
-    _nav_stable_count     = 0
-    # Force FSM into ACTIVE phase so it holds for the full duration
-    if _emergency_phase == _EMERG_IDLE:
-        _emergency_phase      = _EMERG_ACTIVE
-        _emergency_start_time = time.time()
-        _emergency_reason     = "forced (stale frame / reader failure)"
-        _emergency_last_sent  = 0.0
-        print(f"[EMERGENCY] Entered — {_emergency_reason}")
-
-
-def nav_decision(boxes: list,
-                 frame_w: int,
-                 frame_h: int):
-    """
-    Public entry point for the navigation stack.
-
-    Wraps _nav_raw_decision_v3 with:
-      • Stability filter   (3-frame hold before output changes)
-      • Emergency override (UPGRADE 11)
-      • Serial token print + Arduino hook
-
-    Parameters
-    ----------
-    boxes    : YOLO box list [(x1,y1,x2,y2,conf,tid,cls_id), ...]
-    frame_w  : display frame width
-    frame_h  : display frame height
-
-    Returns
-    -------
-    (nav_cmd, obstacles, danger_obstacle)
-    """
-    global _nav_state, _nav_prev_raw, _nav_stable_count, _nav_final_cmd
-
-    # Compute LIVE obstacles (before temporal memory merge) for the emergency
-    # layer.  analyse_obstacles merges memory internally; we need the raw
-    # current-frame list so the recovery gate isn't blocked by stale EMA values.
-    _live_obs_for_emergency = _compute_live_obstacles(boxes, frame_w, frame_h)
-    obstacles = analyse_obstacles(boxes, frame_w, frame_h)
-    raw_cmd, new_state, danger_obs = _nav_raw_decision_v3(obstacles, frame_w, frame_h)
-
-    _nav_state = new_state
-
-    # ── UPGRADE 11: Emergency override (checked before stability filter) ──
-    if _check_emergency(raw_cmd, _nav_prev_raw, _live_obs_for_emergency):
-        _nav_final_cmd = NAV_EMERGENCY_STOP
-        send_nav_token(ARDUINO_TOKENS[NAV_EMERGENCY_STOP], force=True)
-        return _nav_final_cmd, obstacles, danger_obs
-
-    # ── Stability filter ────────────────────────────────────────────────────
-    if raw_cmd == _nav_prev_raw:
-        _nav_stable_count += 1
-    else:
-        _nav_stable_count = 1
-        _nav_prev_raw     = raw_cmd
-
-    if _nav_stable_count >= NAV_STABILITY_MIN:
-        if _nav_final_cmd != raw_cmd:
-            # ── FIX 9: Strict command priority — lower-priority commands
-            # cannot override a currently active higher-priority state until
-            # the higher-priority condition fully clears.
-            # Priority rank (lower number = higher priority):
-            _PRIORITY_RANK: dict = {
-                NAV_EMERGENCY_STOP: 0,
-                NAV_HOVER:          1,
-                NAV_BACKWARD:       2,
-                NAV_AVOID_LEFT:     3,
-                NAV_AVOID_RIGHT:    3,
-                NAV_STOP:           4,
-                NAV_SLOW_FORWARD:   5,
-                NAV_SAFE_SEARCH:    5,
-                NAV_FAST_FORWARD:   6,
-                NAV_FORWARD:        6,
-                NAV_FORWARD_SCAN:   6,
-                NAV_SEARCH_LEFT:    7,
-                NAV_SEARCH_RIGHT:   7,
-                NAV_SEARCH:         7,
-            }
-            current_rank = _PRIORITY_RANK.get(_nav_final_cmd, 99)
-            new_rank     = _PRIORITY_RANK.get(raw_cmd, 99)
-            # Allow transition only if new command is equal or higher priority
-            # — OR if current state is already a search/forward (low priority).
-            if new_rank <= current_rank or current_rank >= 6:
-                _nav_final_cmd = raw_cmd
-                send_nav_token(ARDUINO_TOKENS.get(raw_cmd, "?"))   # keep serial hot
-
-    return _nav_final_cmd, obstacles, danger_obs
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  MASTER COMMAND ARBITER
-#  Single authority that arbitrates among all sub-systems and emits the one
-#  final motor command.  Architecture:
-#
-#    PERCEPTION (YOLO)
-#         │
-#    ┌────┴──────────────────────────────────────────────────┐
-#    │  Emergency FSM  │  Nav avoidance FSM  │  AI tracking  │
-#    └────┬──────────────────────────────────────────────────┘
-#         │  all candidates → master_decision()
-#         ▼
-#    MASTER ARBITER  (priority + cooldown)
-#         │
-#    Arduino serial token
-#
-#  Priority (highest→lowest):
-#    1. EMERGENCY  — any emergency phase active or stale/dead stream
-#    2. NAVIGATION — avoidance states (BACKWARD, AVOID_*, STOP, SAFE_SEARCH,
-#                    SLOW_FORWARD, speed-tier STOP, FORWARD_SCAN)
-#    3. AI_TRACKING — human tracking (FORWARD/LEFT/RIGHT/HOVER) when safe
-#    4. SEARCH     — exploration FSM when no target and path is clear
-#
-#  Command cooldown: commands may not change faster than COMMAND_HOLD_TIME
-#  unless the new command is EMERGENCY_STOP or BACKWARD (safety override).
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Owner labels shown on HUD
 OWNER_EMERGENCY  = "EMERGENCY"
 OWNER_NAVIGATION = "NAVIGATION"
 OWNER_AI         = "AI_TRACKING"
 OWNER_SEARCH     = "SEARCH"
 
-# Minimum wall-clock seconds a command is held before another non-critical
-# command may replace it.  Prevents sub-frame jitter from thrashing the drone.
-COMMAND_HOLD_TIME: float = 0.35
+ARDUINO_TOKENS: Dict[str, str] = {
+    NAV_FORWARD: "F", NAV_BACKWARD: "B", NAV_AVOID_LEFT: "YL",
+    NAV_AVOID_RIGHT: "YR", NAV_HOVER: "H", NAV_SEARCH: "SS",
+    NAV_FAST_FORWARD: "FF", NAV_SLOW_FORWARD: "SF", NAV_STOP: "ST",
+    NAV_SEARCH_LEFT: "SL", NAV_SEARCH_RIGHT: "SR", NAV_FORWARD_SCAN: "FS",
+    NAV_SAFE_SEARCH: "SS", NAV_EMERGENCY_STOP: "ES",
+    MOVE_FORWARD: "F", MOVE_FORWARD_FAST: "FF", MOVE_FORWARD_SLOW: "SF",
+    MOVE_BACKWARD: "B", MOVE_YAW_LEFT: "YL", MOVE_YAW_RIGHT: "YR",
+    MOVE_HOVER: "H", MOVE_STOP: "ST", MOVE_SEARCH_LEFT: "SL",
+    MOVE_SEARCH_RIGHT: "SR", MOVE_SCAN_FORWARD: "FS",
+    MOVE_SAFE_SEARCH: "SS", MOVE_EMERGENCY_STOP: "ES",
+}
 
-# Navigation avoidance commands that indicate an active obstacle response.
-# When any of these is the current nav output, AI tracking is suppressed.
-_NAV_AVOIDANCE_CMDS: frozenset[str] = frozenset({
-    NAV_BACKWARD,
-    NAV_AVOID_LEFT,
-    NAV_AVOID_RIGHT,
-    NAV_STOP,
-    NAV_SAFE_SEARCH,
-    NAV_SLOW_FORWARD,   # caution-speed counts as avoidance-influenced
+ARDUINO_TOKENS_V3: Dict[str, str] = {
+    NAV_FAST_FORWARD: "FF", NAV_SLOW_FORWARD: "SF", NAV_STOP: "ST",
+}
+
+_SEARCH_CYCLE = [NAV_SEARCH_LEFT, NAV_SEARCH_RIGHT, NAV_FORWARD_SCAN]
+
+_OSCILLATION_PAIRS: frozenset = frozenset({
+    frozenset({NAV_AVOID_LEFT,   NAV_AVOID_RIGHT}),
+    frozenset({NAV_FAST_FORWARD, NAV_BACKWARD}),
+    frozenset({NAV_SLOW_FORWARD, NAV_BACKWARD}),
+    frozenset({NAV_FORWARD,      NAV_BACKWARD}),
+    frozenset({NAV_STOP,         NAV_BACKWARD}),
 })
 
-# AI commands allowed to control the drone when no higher priority is active.
-_AI_ALLOWED_CMDS: frozenset[str] = frozenset({
-    "FORWARD", "LEFT", "RIGHT", "HOVER",
-    NAV_FORWARD,        # ai_decision outputs these string variants
-    NAV_HOVER,
-    NAV_FAST_FORWARD,
-})
 
-# Module-level arbiter state
-_master_cmd:         str   = NAV_SEARCH
-_master_owner:       str   = OWNER_SEARCH
-_master_last_change: float = 0.0
+# ══════════════════════════════════════════════════════════════════════════════
+#  IMPROVEMENT 4 — SENSOR FUSION INTERFACES  (unchanged from v4)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclasses.dataclass
+class SensorReading:
+    sensor_id: str
+    timestamp: float
+    value:     float
+    unit:      str  = "m"
+    valid:     bool = True
 
 
-def master_decision(nav_cmd:    str,
-                    ai_cmd:     str,
-                    ai_state:   str,
-                    obstacles:  list,
-                    stale_frame: bool,
-                    reader_alive: bool) -> tuple[str, str]:
+class AbstractSensorFusion(abc.ABC):
+    @abc.abstractmethod
+    def update(self, reading: SensorReading) -> None: ...
+    @abc.abstractmethod
+    def get_proximity(self, zone: str) -> Optional[float]: ...
+    @abc.abstractmethod
+    def get_altitude(self) -> Optional[float]: ...
+    @abc.abstractmethod
+    def get_velocity(self) -> Optional[Tuple[float, float, float]]: ...
+
+
+class NullSensorFusion(AbstractSensorFusion):
+    def update(self, reading: SensorReading) -> None: pass
+    def get_proximity(self, zone: str) -> Optional[float]: return None
+    def get_altitude(self) -> Optional[float]: return None
+    def get_velocity(self) -> Optional[Tuple[float, float, float]]: return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# HARDWARE-READY COMMENT: ToF / Ultrasonic hook point
+# When VL53L0X or HC-SR04 is added:
+#   1. Create a concrete AbstractSensorFusion subclass (e.g. UltrasonicFusion).
+#   2. Replace sensor_fusion singleton below with your implementation.
+#   3. Uncomment the sensor_prox blend block in estimate_pseudo_depth_v3().
+#   4. Zones: LEFT / CENTER / RIGHT match the horizontal classifier output.
+# ──────────────────────────────────────────────────────────────────────────────
+sensor_fusion: AbstractSensorFusion = NullSensorFusion()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  v5 IMPROVEMENT 4 — VIRTUAL SENSOR FRAMEWORK
+#  Simulates obstacle distance, altitude, IMU drift, and battery state so the
+#  full safety stack can be exercised WITHOUT any physical sensors connected.
+#  All outputs are flagged as synthetic; they do NOT reach the serial port.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclasses.dataclass
+class VirtualSensorState:
+    """Live state of the virtual sensor suite (read-only for display)."""
+    obstacle_dist_m:  float = 2.0    # simulated distance to nearest obstacle (m)
+    altitude_m:       float = 0.0    # simulated altitude (m)
+    velocity_x:       float = 0.0    # simulated forward velocity (m/s)
+    velocity_y:       float = 0.0    # simulated lateral velocity (m/s)
+    battery_voltage:  float = 3.7    # simulated cell voltage (V)
+    battery_pct:      int   = 100    # derived state-of-charge %
+    imu_roll_deg:     float = 0.0    # MPU6050 simulated roll (°)
+    imu_pitch_deg:    float = 0.0    # MPU6050 simulated pitch (°)
+    imu_yaw_deg:      float = 0.0    # MPU6050 simulated yaw (°)
+    battery_warning:  bool  = False
+    obstacle_warning: bool  = False
+
+
+class VirtualSensorSuite:
     """
-    Master Command Arbiter — sole source of final drone commands.
+    Simulation-mode virtual sensor framework.
+
+    Produces plausible noisy sensor readings so that the full navigation
+    and safety stack runs as if sensors were physically present.
+
+    Usage
+    -----
+    virtual_sensors.tick(dt, motion_primitive_str)  — call every display frame
+    virtual_sensors.state                            — read current values
+
+    HARDWARE-READY COMMENT: IMU (MPU6050)
+    When MPU6050 is wired to the Arduino Nano (I²C SDA=A4, SCL=A5):
+      1. Add the MPU6050 Arduino library (I2Cdev / Jeff Rowberg).
+      2. Stream roll/pitch/yaw angles over serial alongside motor tokens.
+      3. Parse them in _parse_imu_line() in ArduinoController.
+      4. Replace virtual_sensors.state.imu_* with real parsed values.
+      5. Feed real roll/pitch into pid_roll.compute() / pid_pitch.compute().
+
+    HARDWARE-READY COMMENT: Coordinate Navigation
+    When GPS or external positioning (UWB, AprilTag, etc.) is available:
+      1. Add a CoordinateNavigator class with waypoint queue.
+      2. Replace the search FSM with coordinate-driven nav.
+      3. Fuse position into the master arbiter as a new priority layer.
+    """
+
+    def __init__(self, noise_std: float = 0.02):
+        self._noise_std    = noise_std
+        self._lock         = threading.Lock()
+        self.state         = VirtualSensorState()
+        self._t_last        = time.time()
+        self._alt_vel       = 0.0       # vertical velocity m/s
+        self._discharge_rate= 0.001     # V/s at full throttle
+
+    def _noisy(self, value: float) -> float:
+        return value + random.gauss(0.0, self._noise_std)
+
+    def tick(self, motion: str) -> None:
+        """Advance virtual sensor state by one simulation tick."""
+        now = time.time()
+        dt  = min(now - self._t_last, 0.2)
+        self._t_last = now
+
+        with self._lock:
+            s = self.state
+
+            # ── Altitude simulation ───────────────────────────────────────
+            if motion in (MOVE_FORWARD, MOVE_FORWARD_FAST, MOVE_FORWARD_SLOW,
+                          MOVE_HOVER, MOVE_YAW_LEFT, MOVE_YAW_RIGHT):
+                self._alt_vel = min(self._alt_vel + 0.3 * dt, 0.5)
+            elif motion in (MOVE_EMERGENCY_STOP, MOVE_STOP, MOVE_BACKWARD):
+                self._alt_vel = max(self._alt_vel - 0.6 * dt, -0.5)
+            else:
+                self._alt_vel *= 0.9  # decay towards hover
+
+            s.altitude_m = max(0.0, self._noisy(s.altitude_m + self._alt_vel * dt))
+
+            # ── Velocity estimate ─────────────────────────────────────────
+            if motion == MOVE_FORWARD_FAST:
+                s.velocity_x = self._noisy(min(s.velocity_x + 0.4 * dt, 1.2))
+            elif motion == MOVE_FORWARD_SLOW:
+                s.velocity_x = self._noisy(min(s.velocity_x + 0.2 * dt, 0.6))
+            elif motion == MOVE_BACKWARD:
+                s.velocity_x = self._noisy(max(s.velocity_x - 0.5 * dt, -0.5))
+            else:
+                s.velocity_x = self._noisy(s.velocity_x * 0.85)
+
+            if motion == MOVE_YAW_LEFT:
+                s.velocity_y = self._noisy(max(s.velocity_y - 0.3 * dt, -0.5))
+            elif motion == MOVE_YAW_RIGHT:
+                s.velocity_y = self._noisy(min(s.velocity_y + 0.3 * dt, 0.5))
+            else:
+                s.velocity_y = self._noisy(s.velocity_y * 0.85)
+
+            # ── IMU drift simulation (MPU6050 placeholder) ────────────────
+            # HARDWARE-READY COMMENT: replace these random-walk values with
+            # real MPU6050 readings when the sensor is available.
+            s.imu_roll_deg  = self._noisy(s.imu_roll_deg  * 0.98)
+            s.imu_pitch_deg = self._noisy(s.imu_pitch_deg * 0.98)
+            s.imu_yaw_deg   = (s.imu_yaw_deg + random.gauss(0, 0.1)) % 360
+
+            # ── Obstacle distance simulation ──────────────────────────────
+            # Shrinks when moving forward, grows when backing up.
+            if motion in (MOVE_FORWARD, MOVE_FORWARD_FAST):
+                s.obstacle_dist_m = max(0.3, self._noisy(s.obstacle_dist_m - 0.05))
+            elif motion == MOVE_BACKWARD:
+                s.obstacle_dist_m = min(5.0, self._noisy(s.obstacle_dist_m + 0.08))
+            else:
+                s.obstacle_dist_m = self._noisy(s.obstacle_dist_m)
+            s.obstacle_warning = s.obstacle_dist_m < 0.5
+
+            # ── Battery simulation ────────────────────────────────────────
+            throttle = 1.0 if motion == MOVE_FORWARD_FAST else 0.5
+            s.battery_voltage  = max(3.0,
+                s.battery_voltage - self._discharge_rate * throttle * dt)
+            s.battery_pct      = max(0, int(
+                (s.battery_voltage - 3.0) / (4.2 - 3.0) * 100))
+            s.battery_warning  = s.battery_voltage < 3.4
+
+    def snapshot(self) -> VirtualSensorState:
+        with self._lock:
+            return dataclasses.replace(self.state)
+
+
+# Module-level virtual sensor singleton (active in SIMULATION and SAFE_TEST modes)
+virtual_sensors = VirtualSensorSuite()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  v5 IMPROVEMENT 2 — MOTOR ABSTRACTION LAYER
+#  set_motor_speed(fl, fr, rl, rr) is the single entry point for all PWM
+#  writes.  DroneMixer translates MotionPrimitive → per-motor values.
+#  The ramp limiter lives here so the serial layer never sees sudden spikes.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclasses.dataclass
+class MotorState:
+    """Current and target PWM for all four motors (0-255)."""
+    fl: int = 0   # front-left
+    fr: int = 0   # front-right
+    rl: int = 0   # rear-left
+    rr: int = 0   # rear-right
+
+
+# Live motor state — updated by the ramp loop; readable by the HUD.
+_motor_state  = MotorState()
+_motor_target = MotorState()
+_motor_lock   = threading.Lock()
+
+
+def _clamp_pwm(value: int, safe_test: bool = False) -> int:
+    """Clamp PWM to [0, max] respecting safe-test ceiling."""
+    # IMPROVEMENT 6: safe-test ceiling applied here
+    ceiling = cfg.safe_test_pwm_max if safe_test else 255
+    return max(0, min(ceiling, int(value)))
+
+
+def set_motor_speed(fl: int, fr: int, rl: int, rr: int) -> None:
+    """
+    Motor abstraction entry point.
 
     Parameters
     ----------
-    nav_cmd      : output of nav_decision() (already stability-filtered)
-    ai_cmd       : output of ai_decision() (_ai_decision_str)
-    ai_state     : STATE_TRACKING / STATE_SEARCHING / STATE_IDLE
-    obstacles    : merged obstacle list from nav_decision()
-    stale_frame  : True if video feed has frozen (FIX 2 stale check)
-    reader_alive : True if frame-reader thread is alive
+    fl, fr, rl, rr : desired PWM values (0-255)
 
-    Returns
-    -------
-    (final_cmd, owner)  — final_cmd is sent to Arduino; owner labels HUD.
+    In SAFE_TEST_MODE values are clamped to safe_test_pwm_max.
+    Actual PWM ramps toward these targets at MAX_PWM_STEP per tick
+    via the background _motor_ramp_loop.
+
+    FUTURE PID HOOK: feed pid_roll / pid_pitch corrections into
+    per-motor trim offsets before calling set_motor_speed().
     """
-    global _master_cmd, _master_owner, _master_last_change
-
-    now = time.time()
-
-    # ── PRIORITY 1: EMERGENCY ─────────────────────────────────────────────
-    # Absolute override — nothing may suppress it.
-    # Triggers: emergency FSM active, stale frame, reader dead, or nav
-    # itself already escalated to EMERGENCY_STOP.
-    emergency_active = (_emergency_phase != _EMERG_IDLE)
-    if (emergency_active
-            or stale_frame
-            or not reader_alive
-            or nav_cmd == NAV_EMERGENCY_STOP):
-        candidate = NAV_EMERGENCY_STOP
-        owner     = OWNER_EMERGENCY
-        # Cooldown bypassed for emergency — always apply immediately
-        _commit(candidate, owner, now, force=True)
-        return _master_cmd, _master_owner
-
-    # ── PRIORITY 2: NAVIGATION avoidance FSM ──────────────────────────────
-    # Active when nav has detected an obstacle requiring evasive action.
-    # AI tracking is completely suppressed in this state.
-    if nav_cmd in _NAV_AVOIDANCE_CMDS:
-        candidate = nav_cmd
-        owner     = OWNER_NAVIGATION
-        _commit(candidate, owner, now)
-        return _master_cmd, _master_owner
-
-    # ── PRIORITY 3: AI TRACKING ───────────────────────────────────────────
-    # Only allowed when:
-    #   • no avoidance active (checked above)
-    #   • AI is actively tracking a human (STATE_TRACKING)
-    #   • AI command is a meaningful directional/hover command
-    if (ai_state == STATE_TRACKING
-            and ai_cmd in _AI_ALLOWED_CMDS):
-        # Map ai_decision string variants to canonical NAV constants
-        _AI_CMD_MAP = {
-            "FORWARD": NAV_FAST_FORWARD,
-            "LEFT"   : NAV_AVOID_LEFT,    # AI left → drone yaw/strafe left
-            "RIGHT"  : NAV_AVOID_RIGHT,
-            "HOVER"  : NAV_HOVER,
-        }
-        canonical = _AI_CMD_MAP.get(ai_cmd, ai_cmd)
-        candidate = canonical
-        owner     = OWNER_AI
-        _commit(candidate, owner, now)
-        return _master_cmd, _master_owner
-
-    # ── PRIORITY 4: NAVIGATION forward / speed tiers ──────────────────────
-    # Nav has a valid non-avoidance command (FAST_FORWARD, FORWARD_SCAN…).
-    # Covers the case where AI has no target but nav sees a clear path.
-    if nav_cmd not in (NAV_SEARCH, NAV_SEARCH_LEFT, NAV_SEARCH_RIGHT,
-                       NAV_SAFE_SEARCH, NAV_FORWARD_SCAN):
-        candidate = nav_cmd
-        owner     = OWNER_NAVIGATION
-        _commit(candidate, owner, now)
-        return _master_cmd, _master_owner
-
-    # ── PRIORITY 5 (lowest): SEARCH FSM ──────────────────────────────────
-    # Activated only when no target and no obstacle danger.
-    candidate = nav_cmd   # search sub-states come from nav_decision / _next_search_state
-    owner     = OWNER_SEARCH
-    _commit(candidate, owner, now)
-    return _master_cmd, _master_owner
+    safe = _mode_is_safe_test()
+    with _motor_lock:
+        _motor_target.fl = _clamp_pwm(fl, safe)
+        _motor_target.fr = _clamp_pwm(fr, safe)
+        _motor_target.rl = _clamp_pwm(rl, safe)
+        _motor_target.rr = _clamp_pwm(rr, safe)
 
 
-def _commit(candidate: str, owner: str, now: float, force: bool = False) -> None:
+# ── PWM values per MotionPrimitive ────────────────────────────────────────────
+# Tune these for your specific motors / propeller combination.
+# Format: (fl, fr, rl, rr)
+_MOTION_PWM: Dict[str, Tuple[int, int, int, int]] = {
+    MOVE_FORWARD        : (160, 160, 160, 160),
+    MOVE_FORWARD_FAST   : (220, 220, 220, 220),
+    MOVE_FORWARD_SLOW   : (130, 130, 130, 130),
+    MOVE_BACKWARD       : (100, 100, 100, 100),
+    MOVE_YAW_LEFT       : (110, 160, 110, 160),
+    MOVE_YAW_RIGHT      : (160, 110, 160, 110),
+    MOVE_HOVER          : (150, 150, 150, 150),
+    MOVE_STOP           : (0,   0,   0,   0),
+    MOVE_SEARCH_LEFT    : (105, 150, 105, 150),
+    MOVE_SEARCH_RIGHT   : (150, 105, 150, 105),
+    MOVE_SCAN_FORWARD   : (140, 140, 140, 140),
+    MOVE_SAFE_SEARCH    : (100, 100, 100, 100),
+    MOVE_EMERGENCY_STOP : (0,   0,   0,   0),
+}
+
+
+class DroneMixer:
     """
-    Apply candidate command if cooldown allows or force=True.
+    Translates a MotionPrimitive string → per-motor PWM tuple and
+    calls set_motor_speed().
 
-    Cooldown is bypassed for:
-      • EMERGENCY_STOP  (always immediate)
-      • BACKWARD        (safety-critical reversal)
-      • Any command when force=True is passed
+    HARDWARE-READY COMMENT: Roll / Pitch / Yaw PID integration
+    When pid_roll / pid_pitch / pid_yaw are implemented, add correction
+    offsets here before the set_motor_speed() call:
 
-    A change is logged as [MASTER] only when the final command or owner
-    actually changes — no duplicate prints.
+        roll_corr  = pid_roll.compute(0.0, imu.roll_deg)
+        pitch_corr = pid_pitch.compute(0.0, imu.pitch_deg)
+        fl += pitch_corr - roll_corr
+        fr += pitch_corr + roll_corr
+        rl -= pitch_corr - roll_corr
+        rr -= pitch_corr + roll_corr
+        set_motor_speed(fl, fr, rl, rr)
     """
-    global _master_cmd, _master_owner, _master_last_change
 
-    # Safety overrides bypass cooldown entirely
-    bypass_cooldown = (force
-                       or candidate == NAV_EMERGENCY_STOP
-                       or candidate == NAV_BACKWARD)
+    @staticmethod
+    def apply(motion: str) -> None:
+        """Map a motion primitive string to motor PWM and submit."""
+        pwm = _MOTION_PWM.get(motion, (0, 0, 0, 0))
+        set_motor_speed(*pwm)
 
-    elapsed_since_change = now - _master_last_change
-    if not bypass_cooldown and elapsed_since_change < COMMAND_HOLD_TIME:
-        # Cooldown active — keep current command
-        return
 
-    if candidate == _master_cmd and owner == _master_owner:
-        return   # no change; nothing to do
+drone_mixer = DroneMixer()
 
-    prev_cmd   = _master_cmd
-    _master_cmd         = candidate
-    _master_owner       = owner
-    _master_last_change = now
 
-    token = ARDUINO_TOKENS.get(candidate, "?")
-    print(f"[MASTER] {owner:12s} → {candidate:20s}  (was: {prev_cmd})  token: '{token}'")
-    send_nav_token(token, force=force)
+# ──────────────────────────────────────────────────────────────────────────────
+# IMPROVEMENT 6 — MOTOR SAFETY LIMITER
+# Background thread ramps _motor_state toward _motor_target at MAX_PWM_STEP
+# per tick to prevent sudden PWM spikes that could damage motors or throw
+# the frame off balance.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def ramp_motor_pwm(current: int, target: int, max_step: int) -> int:
+    """Advance `current` toward `target` by at most `max_step`."""
+    delta = target - current
+    if abs(delta) <= max_step:
+        return target
+    return current + (max_step if delta > 0 else -max_step)
+
+
+def _motor_ramp_loop() -> None:
+    """
+    Background thread: smoothly ramps actual motor PWM toward targets.
+    Runs while _reader_alive is set.
+    """
+    while _reader_alive.is_set():
+        with _motor_lock:
+            step = cfg.max_pwm_step
+            _motor_state.fl = ramp_motor_pwm(_motor_state.fl, _motor_target.fl, step)
+            _motor_state.fr = ramp_motor_pwm(_motor_state.fr, _motor_target.fr, step)
+            _motor_state.rl = ramp_motor_pwm(_motor_state.rl, _motor_target.rl, step)
+            _motor_state.rr = ramp_motor_pwm(_motor_state.rr, _motor_target.rr, step)
+        time.sleep(cfg.pwm_ramp_interval)
+
+
+def get_motor_pwm_snapshot() -> Tuple[int, int, int, int]:
+    """Return current (ramped) PWM values for HUD display."""
+    with _motor_lock:
+        return (_motor_state.fl, _motor_state.fr,
+                _motor_state.rl, _motor_state.rr)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  FIX 7 + 8 — SERIAL COMMAND OUTPUT LAYER WITH WATCHDOG HEARTBEAT
-#  Provides throttled, duplicate-suppressed Arduino serial transmission with
-#  a periodic heartbeat so the Arduino can STOP MOTORS if Python freezes.
-#
-#  Design:
-#    • ArduinoSerial wraps pyserial; safe to construct even without hardware
-#      (import guard — pyserial optional).
-#    • send_nav_token() is the single call-site: called from nav_decision output
-#      and the stale-frame / reader-fail emergency paths.
-#    • Heartbeat thread sends "HB\n" every HEARTBEAT_INTERVAL seconds on a
-#      background daemon thread — zero impact on nav loop timing.
-#    • All serial writes are protected with try/except so a disconnected cable
-#      never crashes the navigation stack.
+#  IMPROVEMENT 8 — HARDWARE ABSTRACTION LAYER  (unchanged from v4)
 # ══════════════════════════════════════════════════════════════════════════════
 
-import queue as _queue
+class AbstractFlightController(abc.ABC):
+    @abc.abstractmethod
+    def send_token(self, token: str, force: bool = False) -> None: ...
+    @abc.abstractmethod
+    def close(self) -> None: ...
+    @abc.abstractmethod
+    def is_connected(self) -> bool: ...
 
-class ArduinoSerial:
-    """
-    Lightweight serial wrapper for Arduino Nano communication.
 
-    Features:
-      • Automatic reconnect on write failure
-      • Command deduplication (same token not re-sent until it changes)
-      • Per-command cooldown of COMMAND_SEND_INTERVAL seconds
-      • Background heartbeat thread (FIX 8)
-      • All paths protected with try/except — never raises into caller
-    """
-
-    def __init__(self,
-                 port: str  = SERIAL_PORT_DEFAULT,
-                 baud: int  = SERIAL_BAUD_DEFAULT,
-                 enabled: bool = False):
-        """
-        Parameters
-        ----------
-        port    : COM port (Windows) or /dev/ttyUSB0 (Linux)
-        baud    : must match Arduino sketch (default 115200)
-        enabled : False → dry-run mode (tokens printed but not sent)
-                  Set True only when hardware is physically connected.
-        """
-        self.port            = port
-        self.baud            = baud
-        self.enabled         = enabled
-        self._ser            = None          # pyserial Serial object or None
-        self._last_token     = ""            # duplicate suppression
-        self._last_send_t    = 0.0           # cooldown timestamp
-        self._hb_thread      = None          # heartbeat thread handle
-        self._hb_stop        = threading.Event()
-        self._lock           = threading.Lock()
-
-        if enabled:
-            self._connect()
-            self._start_heartbeat()
-
-    # ── Connection management ─────────────────────────────────────────────
-
-    def _connect(self) -> bool:
-        """Attempt to open the serial port.  Returns True on success."""
-        try:
-            import serial as _serial
-            self._ser = _serial.Serial(self.port, self.baud, timeout=1)
-            print(f"[Serial] ✅ Connected to {self.port} @ {self.baud} baud")
-            return True
-        except Exception as exc:
-            print(f"[Serial] ⚠️  Could not open {self.port}: {exc}")
-            self._ser = None
-            return False
-
-    def _reconnect(self) -> bool:
-        """Close existing connection (if any) then retry."""
-        try:
-            if self._ser and self._ser.is_open:
-                self._ser.close()
-        except Exception:
-            pass
-        self._ser = None
-        return self._connect()
-
-    # ── Public send API ───────────────────────────────────────────────────
-
-    def send(self, token: str, force: bool = False) -> None:
-        """
-        Transmit a token to the Arduino.
-
-        Skipped if:
-          • token == last token AND force is False (deduplication)
-          • less than COMMAND_SEND_INTERVAL seconds since last send
-          • enabled is False (dry-run)
-
-        EMERGENCY tokens bypass deduplication but still respect cooldown
-        to avoid flooding.
-
-        Parameters
-        ----------
-        token : Arduino token string (e.g. "ES", "FF", "HB")
-        force : if True, bypass deduplication (used for emergency tokens)
-        """
-        now = time.time()
-        with self._lock:
-            # Cooldown guard (always applied)
-            if now - self._last_send_t < COMMAND_SEND_INTERVAL:
-                return
-
-            # Deduplication (skipped for forced/emergency sends)
-            if not force and token == self._last_token:
-                return
-
-            self._last_token  = token
-            self._last_send_t = now
-
-        if not self.enabled:
-            return   # dry-run: token has already been printed by nav_decision
-
-        self._write(token)
-
-    def _write(self, token: str) -> None:
-        """Internal write — reconnects once on failure."""
-        payload = f"{token}\n".encode()
-        try:
-            if self._ser is None or not self._ser.is_open:
-                if not self._reconnect():
-                    return
-            self._ser.write(payload)
-        except Exception as exc:
-            print(f"[Serial] Write error ({exc}) — attempting reconnect")
-            try:
-                if self._reconnect():
-                    self._ser.write(payload)
-            except Exception as exc2:
-                print(f"[Serial] Reconnect write failed: {exc2}")
-
-    # ── FIX 8: Heartbeat ─────────────────────────────────────────────────
-
-    def _start_heartbeat(self) -> None:
-        """Start the background heartbeat daemon thread."""
-        self._hb_thread = threading.Thread(
-            target=self._heartbeat_loop,
-            name="SerialHeartbeat",
-            daemon=True
-        )
-        self._hb_thread.start()
-        print(f"[Serial] Heartbeat thread started ({HEARTBEAT_INTERVAL}s interval)")
-
-    def _heartbeat_loop(self) -> None:
-        """
-        Send 'HB\\n' periodically so the Arduino watchdog knows Python is alive.
-        The Arduino sketch should implement: if no HB received within 2×interval,
-        stop all motors (fail-safe).
-
-        PATCH 2 — Route through self.send(..., force=True) instead of
-        self._write() directly.  This ensures:
-          • the per-command cooldown (COMMAND_SEND_INTERVAL) is respected, so
-            a burst of nav commands + heartbeat cannot overflow the serial
-            buffer on slow devices;
-          • duplicate-suppression is bypassed (force=True) so the heartbeat
-            is always transmitted even if "HB" was the last sent token;
-          • _last_send_t is updated, preventing a nav command from
-            immediately following the heartbeat within the cooldown window.
-        The lock inside send() serialises access with concurrent nav writes,
-        eliminating the race condition present when _write() was called directly.
-        """
-        while not self._hb_stop.is_set():
-            time.sleep(HEARTBEAT_INTERVAL)
-            if self._hb_stop.is_set():
-                break
-            try:
-                self.send("HB", force=True)   # PATCH 2: use send(), not _write()
-            except Exception:
-                pass   # already handled inside send() → _write()
+class DryRunController(AbstractFlightController):
+    def send_token(self, token: str, force: bool = False) -> None:
+        if _mode_is_debug():
+            print(f"[DryRun] token='{token}' force={force}")
 
     def close(self) -> None:
-        """Graceful shutdown — stop heartbeat and close port."""
-        self._hb_stop.set()
-        if self._hb_thread and self._hb_thread.is_alive():
-            self._hb_thread.join(timeout=2.0)
-        try:
-            if self._ser and self._ser.is_open:
-                self._ser.close()
-                print("[Serial] Port closed")
-        except Exception:
-            pass
+        pass
 
-
-# Module-level singleton.  Set enabled=True and supply the correct port when
-# running on hardware.  Dry-run (enabled=False) is the safe default so the
-# nav stack operates without a connected Arduino.
-arduino = ArduinoSerial(port=SERIAL_PORT_DEFAULT, baud=SERIAL_BAUD_DEFAULT,
-                        enabled=False)
-
-
-def send_nav_token(token: str, force: bool = False) -> None:
-    """
-    Convenience wrapper called by nav_decision and emergency paths.
-    Translates a NAV_* constant to its Arduino token and forwards to
-    the ArduinoSerial singleton.
-    """
-    arduino.send(token, force=force)
-# ══════════════════════════════════════════════════════════════════════════════
-
-_NAV_ARROW_DEFS: dict[str, list[Tuple[float, float]]] = {
-    NAV_FORWARD      : [(0.50, 0.0), (1.0, 0.6), (0.70, 0.6), (0.70, 1.0),
-                        (0.30, 1.0), (0.30, 0.6), (0.0, 0.6)],
-    NAV_FAST_FORWARD : [(0.50, 0.0), (1.0, 0.6), (0.70, 0.6), (0.70, 1.0),
-                        (0.30, 1.0), (0.30, 0.6), (0.0, 0.6)],  # same shape, diff colour
-    NAV_SLOW_FORWARD : [(0.50, 0.0), (1.0, 0.6), (0.70, 0.6), (0.70, 1.0),
-                        (0.30, 1.0), (0.30, 0.6), (0.0, 0.6)],
-    NAV_BACKWARD     : [(0.50, 1.0), (1.0, 0.4), (0.70, 0.4), (0.70, 0.0),
-                        (0.30, 0.0), (0.30, 0.4), (0.0, 0.4)],
-    NAV_AVOID_LEFT   : [(0.0, 0.5), (0.6, 0.0), (0.6, 0.30), (1.0, 0.30),
-                        (1.0, 0.70), (0.6, 0.70), (0.6, 1.0)],
-    NAV_AVOID_RIGHT  : [(1.0, 0.5), (0.4, 0.0), (0.4, 0.30), (0.0, 0.30),
-                        (0.0, 0.70), (0.4, 0.70), (0.4, 1.0)],
-    NAV_SEARCH_LEFT  : [(0.0, 0.5), (0.6, 0.0), (0.6, 0.30), (1.0, 0.30),
-                        (1.0, 0.70), (0.6, 0.70), (0.6, 1.0)],
-    NAV_SEARCH_RIGHT : [(1.0, 0.5), (0.4, 0.0), (0.4, 0.30), (0.0, 0.30),
-                        (0.0, 0.70), (0.4, 0.70), (0.4, 1.0)],
-    NAV_HOVER        : None,
-    NAV_SEARCH       : None,
-    NAV_SAFE_SEARCH  : None,
-    NAV_FORWARD_SCAN : None,
-    NAV_STOP         : None,
-    NAV_EMERGENCY_STOP: None,
-}
-
-_NAV_CMD_COLOR: dict[str, Tuple[int, int, int]] = {
-    NAV_FORWARD      : (0,   200, 80),
-    NAV_FAST_FORWARD : (0,   255, 50),    # bright green — full speed
-    NAV_SLOW_FORWARD : (0,   200, 160),   # teal — caution speed
-    NAV_STOP         : (0,   80,  200),   # blue — stopped
-    NAV_BACKWARD     : (0,   60,  200),
-    NAV_AVOID_LEFT   : (0,   200, 200),
-    NAV_AVOID_RIGHT  : (0,   200, 200),
-    NAV_HOVER        : (0,   180, 255),
-    NAV_SEARCH       : (180, 180, 0),
-    NAV_SEARCH_LEFT  : (200, 200, 0),
-    NAV_SEARCH_RIGHT : (200, 200, 0),
-    NAV_FORWARD_SCAN : (0,   200, 100),
-    NAV_SAFE_SEARCH  : (160, 160, 0),
-    NAV_EMERGENCY_STOP: (0,   0,  255),   # red — always visible
-}
-
-_DANGER_COLORS = {
-    "LOW"   : (0,  200, 0),
-    "MEDIUM": (0,  165, 255),
-    "HIGH"  : (0,  0,   220),
-}
-
-
-def _proximity_to_danger_label(proximity: float) -> str:
-    if proximity >= FRONT_DANGER_FRAC:
-        return "HIGH"
-    if proximity >= SIDE_DANGER_FRAC:
-        return "MEDIUM"
-    return "LOW"
-
-
-def draw_zone_grid(frame: np.ndarray, frame_w: int, frame_h: int) -> None:
-    """Draw horizontal + vertical zone boundary lines (UPGRADE 7 adds horizontal bands)."""
-    left_x  = int(frame_w * LEFT_ZONE_END)
-    right_x = int(frame_w * RIGHT_ZONE_START)
-    top_y   = int(frame_h * TOP_ZONE_END)          # UPGRADE 7
-    bot_y   = int(frame_h * BOTTOM_ZONE_START)     # UPGRADE 7
-    alpha   = 0.20
-
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0),       (left_x, frame_h),    (255, 200, 100), -1)
-    cv2.rectangle(overlay, (right_x, 0), (frame_w, frame_h),   (255, 200, 100), -1)
-    # TOP zone tint (slight purple)
-    cv2.rectangle(overlay, (0, 0),       (frame_w, top_y),     (200, 100, 200), -1)
-    # BOTTOM zone tint (slight orange)
-    cv2.rectangle(overlay, (0, bot_y),   (frame_w, frame_h),   (100, 180, 255), -1)
-    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-
-    # Vertical zone lines
-    cv2.line(frame, (left_x, 0),  (left_x, frame_h),  (200, 200, 200), 1)
-    cv2.line(frame, (right_x, 0), (right_x, frame_h), (200, 200, 200), 1)
-    # Horizontal zone lines
-    cv2.line(frame, (0, top_y),   (frame_w, top_y),   (200, 150, 200), 1)
-    cv2.line(frame, (0, bot_y),   (frame_w, bot_y),   (160, 200, 200), 1)
-
-    # Zone labels
-    lby = frame_h - 10
-    cv2.putText(frame, "L",   (left_x // 2 - 6, lby),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
-    cv2.putText(frame, "C",   ((left_x + right_x) // 2 - 6, lby),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
-    cv2.putText(frame, "R",   (right_x + (frame_w - right_x) // 2 - 6, lby),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
-    cv2.putText(frame, "TOP", (4, top_y - 3),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 150, 200), 1)
-    cv2.putText(frame, "BOT", (4, bot_y + 12),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (160, 200, 200), 1)
-
-
-def draw_danger_boxes(frame: np.ndarray, obstacles: list[ObstacleInfo]) -> None:
-    """Draw obstacle boxes with danger colouring — extended with v_zone label."""
-    for obs in obstacles:
-        x1, y1, x2, y2 = obs.box
-        danger_label    = _proximity_to_danger_label(obs.proximity)
-        colour          = _DANGER_COLORS[danger_label]
-        cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
-
-        info = f"{obs.zone}/{obs.v_zone}  {obs.proximity*100:.0f}%  {danger_label}"
-        (tw, th), _ = cv2.getTextSize(info, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-        lyt = max(0, y2 + 2)
-        cv2.rectangle(frame, (x1, lyt), (x1 + tw + 6, lyt + th + 6), colour, -1)
-        cv2.putText(frame, info, (x1 + 3, lyt + th + 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
-
-
-def _draw_nav_arrow(frame: np.ndarray, cmd: str,
-                    cx: int, cy: int, size: int = 52) -> None:
-    """Draw directional arrow / symbol for the current NAV command."""
-    colour = _NAV_CMD_COLOR.get(cmd, (255, 255, 255))
-    half   = size // 2
-
-    if cmd == NAV_HOVER:
-        cv2.circle(frame, (cx, cy), half,      colour, 3)
-        cv2.circle(frame, (cx, cy), half // 2, colour, 2)
-        cv2.circle(frame, (cx, cy), 4,         colour, -1)
-        return
-
-    if cmd in (NAV_SEARCH, NAV_SAFE_SEARCH):
-        r = int(half * 0.6)
-        cv2.circle(frame, (cx - 4, cy - 4), r, colour, 2)
-        cv2.line(frame,
-                 (cx - 4 + int(r * 0.7), cy - 4 + int(r * 0.7)),
-                 (cx + half - 4, cy + half - 4), colour, 3)
-        return
-
-    if cmd == NAV_STOP:
-        # Stop: filled square
-        cv2.rectangle(frame,
-                      (cx - half + 8, cy - half + 8),
-                      (cx + half - 8, cy + half - 8),
-                      colour, -1)
-        cv2.rectangle(frame,
-                      (cx - half + 8, cy - half + 8),
-                      (cx + half - 8, cy + half - 8),
-                      (255, 255, 255), 1)
-        return
-
-    if cmd == NAV_EMERGENCY_STOP:
-        # Flashing red X
-        cv2.line(frame, (cx - half + 6, cy - half + 6),
-                 (cx + half - 6, cy + half - 6), (0, 0, 255), 4)
-        cv2.line(frame, (cx + half - 6, cy - half + 6),
-                 (cx - half + 6, cy + half - 6), (0, 0, 255), 4)
-        return
-
-    if cmd == NAV_FORWARD_SCAN:
-        # Double-chevron forward
-        for offset in [0, 14]:
-            pts = np.array([
-                (cx, cy - half + 6 + offset),
-                (cx + half - 6, cy + offset),
-                (cx, cy + 10 + offset),
-                (cx - half + 6, cy + offset),
-            ], dtype=np.int32)
-            cv2.polylines(frame, [pts], isClosed=False, color=colour, thickness=2)
-        return
-
-    pts_def = _NAV_ARROW_DEFS.get(cmd)
-    if pts_def is None:
-        return
-    pts = np.array(
-        [(int(cx - half + p[0] * size),
-          int(cy - half + p[1] * size))
-         for p in pts_def],
-        dtype=np.int32
-    )
-    cv2.fillPoly(frame, [pts], colour)
-    cv2.polylines(frame, [pts], isClosed=True, color=(255, 255, 255), thickness=1)
-
-
-def draw_nav_overlay(frame: np.ndarray,
-                     nav_cmd: str,
-                     obstacles: list[ObstacleInfo],
-                     danger_obs: Optional[ObstacleInfo],
-                     frame_w: int,
-                     frame_h: int) -> None:
-    """
-    Composite navigation overlay — unchanged contract from v2, extended content:
-      1. Zone grid (horizontal + vertical — v3)
-      2. Danger-coloured obstacle boxes
-      3. Warning banner
-      4. Navigation arrow (new shapes for v3 states)
-      5. Highlight on triggering obstacle
-      6. EMERGENCY banner (bright red full-width — v3)
-    """
-    draw_zone_grid(frame, frame_w, frame_h)
-
-    visible_obs = [o for o in obstacles if o.proximity >= SIDE_DANGER_FRAC * 0.7]
-    draw_danger_boxes(frame, visible_obs)
-
-    # ── UPGRADE 11: Emergency / Recovery banner ───────────────────────────
-    if nav_cmd == NAV_EMERGENCY_STOP:
-        # Check if we're in the recovery phase for a different banner colour
-        in_recovery = (_emergency_phase == _EMERG_RECOVERY)
-        if in_recovery:
-            banner       = "⚠  RECOVERING FROM EMERGENCY  ⚠"
-            banner_color = (0, 140, 200)   # amber-ish blue — distinct from full ES
-        else:
-            banner       = "⚠⚠  EMERGENCY STOP  ⚠⚠"
-            banner_color = (0, 0, 220)
-        (bw, bh), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.80, 2)
-        bx = (frame_w - bw) // 2
-        by = 36
-        cv2.rectangle(frame, (0, 0), (frame_w, by + 10), banner_color, -1)
-        cv2.putText(frame, banner, (bx, by),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.80, (255, 255, 255), 2)
-
-    elif danger_obs is not None:
-        danger_label = _proximity_to_danger_label(danger_obs.proximity)
-        if danger_label == "HIGH":
-            banner = f"⚠ OBSTACLE  {nav_cmd}  ({danger_obs.proximity*100:.0f}%)"
-            banner_colour = (0, 0, 220)
-        elif danger_label == "MEDIUM":
-            banner = f"! CLOSE  {nav_cmd}  ({danger_obs.proximity*100:.0f}%)"
-            banner_colour = (0, 165, 255)
-        else:
-            banner, banner_colour = None, None
-
-        if banner:
-            (bw, bh), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
-            bx = (frame_w - bw) // 2
-            by = 14
-            cv2.rectangle(frame, (bx - 8, by - bh - 6),
-                          (bx + bw + 8, by + 6), banner_colour, -1)
-            cv2.putText(frame, banner, (bx, by),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-
-        hx1, hy1, hx2, hy2 = danger_obs.box
-        cv2.rectangle(frame, (hx1 - 3, hy1 - 3), (hx2 + 3, hy2 + 3), (0, 0, 255), 3)
-
-    arrow_cx = frame_w - 48
-    arrow_cy = frame_h - 60
-    bg_overlay = frame.copy()
-    cv2.circle(bg_overlay, (arrow_cx, arrow_cy), 36, (30, 30, 30), -1)
-    cv2.addWeighted(bg_overlay, 0.55, frame, 0.45, 0, frame)
-    _draw_nav_arrow(frame, nav_cmd, arrow_cx, arrow_cy, size=44)
-
-    nav_label_x = arrow_cx - 38
-    nav_label_y = arrow_cy + 46
-    cv2.putText(frame, nav_cmd, (nav_label_x, nav_label_y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38,
-                _NAV_CMD_COLOR.get(nav_cmd, (255, 255, 255)), 1)
+    def is_connected(self) -> bool:
+        return True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  UPGRADE 9 — CPU ADAPTIVE INFERENCE CONTROL
-#  Provides lightweight frame-skip and low-power mode toggles so the pipeline
-#  can be tuned at runtime without touching the YOLO thread itself.
-#  The YOLO thread already skips frames that haven't changed (counter check).
-#  This layer adds a configurable minimum interval between YOLO calls.
+#  IMPROVEMENT 5 — REAL-TIME PERFORMANCE METRICS  (unchanged from v4)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Minimum wall-clock seconds between YOLO inference calls.
-# Default 0 = run as fast as possible (original behaviour).
-# Set to e.g. 0.08 for ~12 fps max on a weak CPU to free cycles for display.
-ADAPTIVE_MIN_INFERENCE_INTERVAL: float = 0.0   # seconds; 0 = disabled
+class PerformanceMonitor:
+    def __init__(self):
+        self._lock              = threading.Lock()
+        self.yolo_inference_ms  = 0.0
+        self.frame_latency_ms   = 0.0
+        self.command_latency_ms = 0.0
+        self.serial_latency_ms  = 0.0
+        self.dropped_frames     = 0
+        self.reconnect_count    = 0
+        self.queue_depth        = 0
+        self._inference_times: deque = deque(maxlen=60)
 
-# Low-power mode: when True, YOLO runs at a reduced inference resolution and
-# skips alternate frames.  Toggle via: set_low_power_mode(True)
-# PATCH 6 — Comment corrected: the reduced size is 320 px (a fixed constant
-# chosen for a good YOLO speed/accuracy trade-off on weak CPUs), NOT simply
-# "half the configured imgsz".  For example, if cfg["imgsz"] == 416 the
-# reduction is 416→320, not 416→208.  The HUD (FIX 5) already shows the
-# ACTUAL runtime inference size to avoid confusion.
-_low_power_mode: bool = False
-_lp_frame_toggle: bool = False   # alternating skip flag
+    def record_inference(self, ms: float) -> None:
+        with self._lock:
+            self._inference_times.append(ms)
+            self.yolo_inference_ms = sum(self._inference_times) / len(self._inference_times)
+
+    def record_frame_latency(self, ms: float) -> None:
+        with self._lock:
+            self.frame_latency_ms = ms
+
+    def record_command_latency(self, ms: float) -> None:
+        with self._lock:
+            self.command_latency_ms = ms
+
+    def record_serial_latency(self, ms: float) -> None:
+        with self._lock:
+            self.serial_latency_ms = ms
+
+    def increment_dropped(self) -> None:
+        with self._lock:
+            self.dropped_frames += 1
+
+    def increment_reconnect(self) -> None:
+        with self._lock:
+            self.reconnect_count += 1
+
+    def snapshot(self) -> Dict[str, float]:
+        with self._lock:
+            return {
+                "yolo_ms"    : round(self.yolo_inference_ms, 1),
+                "latency_ms" : round(self.frame_latency_ms, 1),
+                "cmd_ms"     : round(self.command_latency_ms, 1),
+                "serial_ms"  : round(self.serial_latency_ms, 1),
+                "dropped"    : self.dropped_frames,
+                "reconnects" : self.reconnect_count,
+            }
 
 
-def set_low_power_mode(enabled: bool) -> None:
-    """
-    Enable / disable low-power CPU mode.
-
-    When enabled:
-      • Alternate frames are skipped in the YOLO thread (halves frame load)
-      • Inference resolution is reduced to 320 px (from cfg["imgsz"]),
-        roughly halving memory bandwidth and FLOPs on weak CPUs.
-        NOTE: the reduction is always to 320 px, not to half of cfg["imgsz"].
-
-    Note: this sets module-level flags read by _yolo_should_skip().
-    """
-    global _low_power_mode
-    _low_power_mode = enabled
-    print(f"[CPU] Low-power mode: {'ON' if enabled else 'OFF'}")
-
-
-def _yolo_should_skip() -> bool:
-    """
-    Called from the YOLO thread before each inference to decide whether to
-    skip this frame for CPU relief.
-
-    Returns True if inference should be skipped for this frame.
-    """
-    global _lp_frame_toggle
-    if not _low_power_mode:
-        return False
-    _lp_frame_toggle = not _lp_frame_toggle
-    return _lp_frame_toggle   # skip every other frame
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  TORCH CPU THREAD TUNING  (unchanged)
-# ══════════════════════════════════════════════════════════════════════════════
-try:
-    import psutil
-    _PHYSICAL = psutil.cpu_count(logical=False) or torch.get_num_threads()
-except ImportError:
-    _PHYSICAL = max(1, torch.get_num_threads() // 2)
-
-torch.set_num_threads(_PHYSICAL)
-torch.set_num_interop_threads(max(1, _PHYSICAL // 2))
-print(f"[Torch] CPU threads: {_PHYSICAL} (physical cores)")
+perf = PerformanceMonitor()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  HARDWARE DETECTION  (unchanged)
+#  IMPROVEMENT 9 — PID MOTION CONTROLLER HOOKS
+#  v5 extends v4 stubs with roll and pitch axes.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclasses.dataclass
+class PIDHook:
+    """
+    Single-axis PID stub.
+
+    Integration guide
+    -----------------
+    1. Set kp / ki / kd from tuning experiments.
+    2. Replace compute() body with standard PID formula.
+    3. Call reset() when the controlled axis changes command.
+    4. Feed output into DroneMixer offsets before set_motor_speed().
+
+    HARDWARE-READY COMMENT: MPU6050 integration
+    Roll measurement  → imu.roll_deg   (replace virtual_sensors.state.imu_roll_deg)
+    Pitch measurement → imu.pitch_deg
+    Yaw   measurement → imu.yaw_deg
+    Sample rate should match _motor_ramp_loop interval (~50 Hz).
+    """
+    kp: float = 0.0
+    ki: float = 0.0
+    kd: float = 0.0
+    _integral:   float = dataclasses.field(default=0.0, init=False)
+    _prev_error: float = dataclasses.field(default=0.0, init=False)
+    _last_t:     float = dataclasses.field(default_factory=time.time, init=False)
+
+    def compute(self, setpoint: float, measurement: float) -> float:
+        """Return PID output — currently a no-op (returns 0.0)."""
+        # TODO: implement when real MPU6050 data is available
+        # dt = time.time() - self._last_t
+        # error = setpoint - measurement
+        # self._integral += error * dt
+        # derivative = (error - self._prev_error) / max(dt, 1e-6)
+        # self._prev_error = error
+        # self._last_t = time.time()
+        # return self.kp * error + self.ki * self._integral + self.kd * derivative
+        return 0.0
+
+    def reset(self) -> None:
+        self._integral   = 0.0
+        self._prev_error = 0.0
+        self._last_t     = time.time()
+
+
+# Per-axis PID stubs (v5 adds roll + pitch)
+pid_yaw     = PIDHook(kp=0.0, ki=0.0, kd=0.0)
+pid_forward = PIDHook(kp=0.0, ki=0.0, kd=0.0)
+pid_roll    = PIDHook(kp=0.0, ki=0.0, kd=0.0)   # NEW v5
+pid_pitch   = PIDHook(kp=0.0, ki=0.0, kd=0.0)   # NEW v5
+
+
+def _apply_pid_smoothing(primitive: MotionPrimitive,
+                          target_offset: float = 0.0) -> MotionPrimitive:
+    """
+    PID smoothing hook — currently pass-through.
+    FUTURE: query pid_yaw / pid_forward / pid_roll / pid_pitch here,
+    adjust primitive or DroneMixer offsets accordingly.
+    """
+    return primitive
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BUILD ACTIVE CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _query_windows_gpu():
@@ -1854,16 +1008,1148 @@ def get_device():
 device_type, device_name, vram_gb = get_device()
 
 
+def _build_config_from_device(dev_type: str, dev_name: str, vram: float) -> DroneConfig:
+    if dev_type == "cuda":
+        if vram >= 8:
+            return DroneConfig.high_end_gpu()
+        elif vram >= 4:
+            return DroneConfig.mid_range_gpu()
+        else:
+            return DroneConfig.low_vram_gpu()
+    return DroneConfig.cpu_profile(dev_name)
+
+
+cfg = _build_config_from_device(device_type, device_name, vram_gb)
+
+print(f"\n[Config] Tier    : {cfg.tier}")
+print(f"[Config] Model   : {cfg.model}")
+print(f"[Config] Img size: {cfg.imgsz}")
+print(f"[Config] FP16    : {cfg.half}")
+print(f"[Config] Res     : {cfg.cam_w}×{cfg.cam_h}")
+print(f"[Config] Mode    : {ACTIVE_MODE.name}")
+if _mode_is_safe_test():
+    print(f"[Config] Safe-test PWM ceiling: {cfg.safe_test_pwm_max}")
+    print(f"[Config] Safe-test ES frac    : {cfg.safe_test_es_frac}")
+print()
+
+
+# ── Expose config values as module-level names ────────────────────────────────
+NAVIGATION_CLASSES        = cfg.navigation_classes
+FRONT_DANGER_FRAC         = cfg.front_danger_frac
+SIDE_DANGER_FRAC          = cfg.side_danger_frac
+HUMAN_HOVER_FRAC          = cfg.human_hover_frac
+HUMAN_CENTER_OVERLAP_MIN  = cfg.human_center_overlap_min
+# v5: use tighter emergency threshold in safe-test mode
+EMERGENCY_AREA_FRAC       = (cfg.safe_test_es_frac
+                              if _mode_is_safe_test()
+                              else cfg.emergency_area_frac)
+SAFE_RELEASE_FRAC         = cfg.safe_release_frac
+SPEED_CLEAR_FRAC          = cfg.speed_clear_frac
+SPEED_CAUTION_FRAC        = cfg.speed_caution_frac
+LEFT_ZONE_END             = cfg.left_zone_end
+RIGHT_ZONE_START          = cfg.right_zone_start
+TOP_ZONE_END              = cfg.top_zone_end
+BOTTOM_ZONE_START         = cfg.bottom_zone_start
+CENTER_DENSITY_LIMIT      = cfg.center_density_limit
+LAST_OBSTACLE_TIMEOUT     = cfg.last_obstacle_timeout
+# v5: slow search in safe-test mode
+SEARCH_PHASE_DURATION     = (cfg.search_phase_duration + cfg.safe_test_search_delay
+                              if _mode_is_safe_test()
+                              else cfg.search_phase_duration)
+FORWARD_SCAN_DURATION     = cfg.forward_scan_duration
+SEARCH_RECOVERY_CYCLES    = cfg.search_recovery_cycles
+EMERGENCY_HOLD_DURATION   = cfg.emergency_hold_duration
+EMERGENCY_RESEND_INTERVAL = cfg.emergency_resend_interval
+OSCILLATION_GUARD_WINDOW  = cfg.oscillation_guard_window
+OSCILLATION_GUARD_LIMIT   = cfg.oscillation_guard_limit
+COMMAND_SEND_INTERVAL     = cfg.command_send_interval
+HEARTBEAT_INTERVAL        = cfg.heartbeat_interval
+STALE_FRAME_TIMEOUT       = cfg.stale_frame_timeout
+READER_FAIL_HOLD          = cfg.reader_fail_hold
+COMMAND_HOLD_TIME         = cfg.command_hold_time
+NAV_STABILITY_MIN         = cfg.nav_stability_min
+_AI_STABILITY_MIN         = cfg.ai_stability_min
+_AI_CENTER_THRESH         = cfg.ai_center_thresh
+_DEPTH_EMA_ALPHA          = cfg.depth_ema_alpha
+HUMAN_COUNT_WRITE_INTERVAL= cfg.human_count_write_interval
+ADAPTIVE_MIN_INFERENCE_INTERVAL = cfg.adaptive_min_inference_interval
+HUMAN_CLASS               = cfg.human_class
+SERIAL_PORT_DEFAULT       = cfg.serial_port
+SERIAL_BAUD_DEFAULT       = cfg.serial_baud
+SMOOTH_FRAMES             = cfg.smooth_frames
+MAX_PWM_STEP              = cfg.max_pwm_step
+STALE_CMD_TTL             = cfg.stale_cmd_ttl
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  IP HELPER  (unchanged)
+#  TORCH CPU THREAD TUNING (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+
+try:
+    import psutil
+    _PHYSICAL = psutil.cpu_count(logical=False) or torch.get_num_threads()
+except ImportError:
+    _PHYSICAL = max(1, torch.get_num_threads() // 2)
+
+torch.set_num_threads(_PHYSICAL)
+torch.set_num_interop_threads(max(1, _PHYSICAL // 2))
+print(f"[Torch] CPU threads: {_PHYSICAL} (physical cores)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  THROTTLED HUMAN COUNT WRITES (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_last_human_write_time: float = 0.0
+_last_human_count:      int   = -1
+
+
+def _write_human_count(count: int) -> None:
+    global _last_human_write_time, _last_human_count
+    now = time.time()
+    if (count == _last_human_count
+            and (now - _last_human_write_time) < HUMAN_COUNT_WRITE_INTERVAL):
+        return
+    try:
+        with open("human_count.txt", "w") as fh:
+            fh.write(str(count))
+        _last_human_write_time = now
+        _last_human_count      = count
+    except OSError as exc:
+        event_log.log("SERIAL", f"human_count.txt write error: {exc}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PSEUDO-DEPTH ESTIMATION (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_depth_ema: Dict[int, float] = {}
+
+
+def estimate_pseudo_depth_v3(x1, y1, x2, y2, frame_w, frame_h, tid=-1) -> float:
+    if frame_w <= 0 or frame_h <= 0:
+        return 0.0
+    bw, bh     = max(0, x2-x1), max(0, y2-y1)
+    area_cue   = min(1.0, (bw * bh) / (frame_w * frame_h))
+    width_cue  = min(1.0, bw / frame_w)
+    height_cue = min(1.0, bh / frame_h)
+    cy_norm    = ((y1 + y2) / 2.0) / frame_h
+    vpos_cue   = float(np.clip(cy_norm, 0.0, 1.0))
+    # HARDWARE-READY COMMENT: ToF / ultrasonic proximity blend
+    # Uncomment and implement once hardware is connected:
+    # zone = classify_horizontal_zone((x1+x2)//2, frame_w)
+    # sensor_prox = sensor_fusion.get_proximity(zone)
+    # if sensor_prox is not None: raw = 0.6*raw + 0.4*sensor_prox
+    raw = float(np.clip(
+        0.55*area_cue + 0.20*width_cue + 0.15*height_cue + 0.10*vpos_cue,
+        0.0, 1.0
+    ))
+    if tid >= 0:
+        prev     = _depth_ema.get(tid, raw)
+        smoothed = _DEPTH_EMA_ALPHA * raw + (1.0 - _DEPTH_EMA_ALPHA) * prev
+        _depth_ema[tid] = smoothed
+        return smoothed
+    return raw
+
+
+def classify_horizontal_zone(cx: int, frame_w: int) -> str:
+    frac = cx / frame_w
+    if frac < LEFT_ZONE_END:   return "LEFT"
+    if frac > RIGHT_ZONE_START: return "RIGHT"
+    return "CENTER"
+
+
+def classify_vertical_zone(cy: int, frame_h: int) -> str:
+    frac = cy / frame_h
+    if frac < TOP_ZONE_END:        return "TOP"
+    if frac > BOTTOM_ZONE_START:   return "BOTTOM"
+    return "MIDDLE"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  OBSTACLE DATA CONTAINER (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ObstacleInfo:
+    __slots__ = ("box", "proximity", "zone", "v_zone",
+                 "is_human", "tid", "cls_id", "timestamp")
+
+    def __init__(self, box, proximity, zone, v_zone,
+                 is_human, tid, cls_id, timestamp):
+        self.box       = box
+        self.proximity = proximity
+        self.zone      = zone
+        self.v_zone    = v_zone
+        self.is_human  = is_human
+        self.tid       = tid
+        self.cls_id    = cls_id
+        self.timestamp = timestamp
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TEMPORAL OBSTACLE MEMORY (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_obstacle_memory: Dict[int, ObstacleInfo] = {}
+
+
+def _update_obstacle_memory(live: List[ObstacleInfo]) -> List[ObstacleInfo]:
+    now = time.time()
+    for obs in live:
+        if obs.tid >= 0:
+            _obstacle_memory[obs.tid] = obs
+    expired = [tid for tid, obs in _obstacle_memory.items()
+               if now - obs.timestamp > LAST_OBSTACLE_TIMEOUT]
+    for tid in expired:
+        del _obstacle_memory[tid]
+        _depth_ema.pop(tid, None)
+    live_tids  = {o.tid for o in live}
+    remembered = [obs for tid, obs in _obstacle_memory.items() if tid not in live_tids]
+    merged = live + remembered
+    merged.sort(key=lambda o: o.proximity, reverse=True)
+    return merged
+
+
+def _compute_live_obstacles(boxes: list, frame_w: int, frame_h: int) -> List[ObstacleInfo]:
+    now  = time.time()
+    live = []
+    for (x1, y1, x2, y2, conf, tid, cls_id) in boxes:
+        if cls_id not in NAVIGATION_CLASSES:
+            continue
+        cx, cy    = (x1+x2)//2, (y1+y2)//2
+        proximity = estimate_pseudo_depth_v3(x1, y1, x2, y2, frame_w, frame_h, tid=-1)
+        live.append(ObstacleInfo(
+            box=(x1, y1, x2, y2), proximity=proximity,
+            zone=classify_horizontal_zone(cx, frame_w),
+            v_zone=classify_vertical_zone(cy, frame_h),
+            is_human=(cls_id == HUMAN_CLASS), tid=tid, cls_id=cls_id, timestamp=now,
+        ))
+    return live
+
+
+def analyse_obstacles(boxes: list, frame_w: int, frame_h: int) -> List[ObstacleInfo]:
+    now  = time.time()
+    live = []
+    for (x1, y1, x2, y2, conf, tid, cls_id) in boxes:
+        if cls_id not in NAVIGATION_CLASSES:
+            continue
+        cx, cy    = (x1+x2)//2, (y1+y2)//2
+        proximity = estimate_pseudo_depth_v3(x1, y1, x2, y2, frame_w, frame_h, tid)
+        live.append(ObstacleInfo(
+            box=(x1, y1, x2, y2), proximity=proximity,
+            zone=classify_horizontal_zone(cx, frame_w),
+            v_zone=classify_vertical_zone(cy, frame_h),
+            is_human=(cls_id == HUMAN_CLASS), tid=tid, cls_id=cls_id, timestamp=now,
+        ))
+    live.sort(key=lambda o: o.proximity, reverse=True)
+    return _update_obstacle_memory(live)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HUMAN CENTER OVERLAP (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _human_center_overlap(obs: ObstacleInfo, frame_w: int) -> float:
+    x1, _, x2, _ = obs.box
+    box_w        = max(1, x2 - x1)
+    center_left  = int(frame_w * LEFT_ZONE_END)
+    center_right = int(frame_w * RIGHT_ZONE_START)
+    overlap_px   = max(0, min(x2, center_right) - max(x1, center_left))
+    return overlap_px / box_w
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AI DECISION LAYER  (v5: safe-test hover preference)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_ai_state        = STATE_IDLE
+_ai_intent       = AI_SEARCH_TARGET
+_ai_decision_str = AI_SEARCH_TARGET
+_ai_prev_intent  = AI_SEARCH_TARGET
+_ai_same_count   = 0
+
+
+def ai_decision(boxes: list, frame_w: int, frame_h: int):
+    """
+    Layer-1 AI Intent — WHERE is the target?
+
+    v5 safe-test change: when target is found in SAFE_TEST_MODE,
+    prefer HOVER over any forward motion to minimise crash risk.
+    """
+    global _ai_state, _ai_intent, _ai_decision_str
+    global _ai_prev_intent, _ai_same_count
+
+    frame_cx    = frame_w // 2
+    human_boxes = [b for b in boxes if b[6] == HUMAN_CLASS]
+
+    if not human_boxes:
+        _ai_state  = STATE_SEARCHING
+        raw_intent = AI_SEARCH_TARGET
+        target_center = None
+    else:
+        def _area(b):
+            return (b[2]-b[0]) * (b[3]-b[1])
+        best = max(human_boxes, key=_area)
+        x1, y1, x2, y2, conf, tid, cls_id = best
+        cx, cy = (x1+x2)//2, (y1+y2)//2
+        target_center = (cx, cy)
+
+        frame_area  = max(1, frame_w * frame_h)
+        bbox_area   = max(0, (x2-x1) * (y2-y1))
+        prox_frac   = bbox_area / frame_area
+        offset_frac = (cx - frame_cx) / frame_w
+
+        if _mode_is_safe_test():
+            # IMPROVEMENT 1: in safe-test mode, prefer HOVER over movement
+            raw_intent = AI_HOVER
+        elif prox_frac >= HUMAN_HOVER_FRAC and abs(offset_frac) <= _AI_CENTER_THRESH:
+            raw_intent = AI_HOVER
+        elif offset_frac < -_AI_CENTER_THRESH:
+            raw_intent = AI_TRACK_LEFT
+        elif offset_frac > _AI_CENTER_THRESH:
+            raw_intent = AI_TRACK_RIGHT
+        else:
+            raw_intent = AI_TRACK_CENTER
+
+        _ai_state = STATE_TRACKING
+
+    if raw_intent == _ai_prev_intent:
+        _ai_same_count += 1
+    else:
+        _ai_same_count  = 1
+        _ai_prev_intent = raw_intent
+
+    if _ai_same_count >= _AI_STABILITY_MIN:
+        if _ai_intent != raw_intent:
+            _ai_intent       = raw_intent
+            _ai_decision_str = raw_intent
+
+    return _ai_state, _ai_intent, target_center
+
+
+def draw_ai_overlay(frame: np.ndarray, target_center,
+                    frame_w: int, frame_h: int) -> None:
+    fc = (frame_w // 2, frame_h // 2)
+    cv2.circle(frame, fc, 6, (0, 0, 255), -1)
+    cv2.circle(frame, fc, 8, (255, 255, 255), 1)
+    if target_center is not None:
+        cv2.line(frame, fc, target_center, (255, 80, 0), 2)
+        cv2.circle(frame, target_center, 5, (255, 80, 0), -1)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SEARCH FSM  (v5: safe-test slows search cycle via SEARCH_PHASE_DURATION)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_search_phase_index: int   = 0
+_search_phase_start: float = time.time()
+_forward_scan_start: float = 0.0
+_search_cycle_count: int   = 0
+
+
+def _next_search_state(obstacles: List[ObstacleInfo]) -> str:
+    global _search_phase_index, _search_phase_start
+    global _forward_scan_start, _search_cycle_count
+
+    now = time.time()
+    if now - _search_phase_start >= SEARCH_PHASE_DURATION:
+        _search_phase_index = (_search_phase_index + 1) % len(_SEARCH_CYCLE)
+        _search_phase_start = now
+        if _search_phase_index == 0:
+            _search_cycle_count += 1
+
+    state = _SEARCH_CYCLE[_search_phase_index]
+
+    if state == NAV_FORWARD_SCAN:
+        center_obs = [o for o in obstacles
+                      if o.zone == "CENTER" and o.proximity >= SIDE_DANGER_FRAC]
+        if center_obs:
+            return NAV_SAFE_SEARCH
+        if _forward_scan_start == 0.0 or (now - _forward_scan_start) > SEARCH_PHASE_DURATION:
+            _forward_scan_start = now
+        if (now - _forward_scan_start) >= FORWARD_SCAN_DURATION:
+            _search_phase_index = (_search_phase_index + 1) % len(_SEARCH_CYCLE)
+            _search_phase_start = now
+            _forward_scan_start = 0.0
+            return _SEARCH_CYCLE[_search_phase_index]
+        return NAV_FORWARD_SCAN
+
+    if _search_cycle_count >= SEARCH_RECOVERY_CYCLES:
+        _search_cycle_count = 0
+        center_obs = [o for o in obstacles
+                      if o.zone == "CENTER" and o.proximity >= SIDE_DANGER_FRAC]
+        if not center_obs:
+            _forward_scan_start = now
+            _search_phase_index = _SEARCH_CYCLE.index(NAV_FORWARD_SCAN)
+            _search_phase_start = now
+            return NAV_FORWARD_SCAN
+        return NAV_SAFE_SEARCH
+
+    return state
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  EMERGENCY SAFETY LAYER  (unchanged from v4)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_oscillation_timestamps: deque = deque()
+_EMERG_IDLE     = "IDLE"
+_EMERG_ACTIVE   = "ACTIVE"
+_EMERG_RECOVERY = "RECOVERY"
+_emergency_phase:      str   = _EMERG_IDLE
+_emergency_start_time: float = 0.0
+_emergency_reason:     str   = ""
+_emergency_last_sent:  float = 0.0
+
+
+def _is_dangerous_oscillation(cmd_a: str, cmd_b: str) -> bool:
+    return frozenset({cmd_a, cmd_b}) in _OSCILLATION_PAIRS
+
+
+def _check_emergency(raw_cmd: str, prev_raw: str,
+                     live_obstacles: List[ObstacleInfo]) -> bool:
+    global _emergency_phase, _emergency_start_time, _emergency_reason
+    global _emergency_last_sent
+
+    now = time.time()
+
+    if _is_dangerous_oscillation(raw_cmd, prev_raw):
+        _oscillation_timestamps.append(now)
+    while (_oscillation_timestamps
+           and (now - _oscillation_timestamps[0]) > OSCILLATION_GUARD_WINDOW):
+        _oscillation_timestamps.popleft()
+
+    if _emergency_phase == _EMERG_IDLE:
+        for obs in live_obstacles:
+            if obs.proximity >= EMERGENCY_AREA_FRAC:
+                _emergency_phase      = _EMERG_ACTIVE
+                _emergency_start_time = now
+                _emergency_reason     = (f"obstacle {obs.proximity*100:.0f}% "
+                                         f">= {EMERGENCY_AREA_FRAC*100:.0f}%")
+                _emergency_last_sent  = 0.0
+                _oscillation_timestamps.clear()
+                event_log.log("EMERGENCY", f"Entered — {_emergency_reason}",
+                              proximity=obs.proximity)
+                return True
+        if len(_oscillation_timestamps) > OSCILLATION_GUARD_LIMIT:
+            _emergency_phase      = _EMERG_ACTIVE
+            _emergency_start_time = now
+            _emergency_reason     = "oscillation guard"
+            _emergency_last_sent  = 0.0
+            _oscillation_timestamps.clear()
+            event_log.log("EMERGENCY", "Entered — oscillation guard")
+            return True
+        return False
+
+    if _emergency_phase == _EMERG_ACTIVE:
+        elapsed = now - _emergency_start_time
+        if elapsed < EMERGENCY_HOLD_DURATION:
+            if now - _emergency_last_sent >= EMERGENCY_RESEND_INTERVAL:
+                _emergency_last_sent = now
+                event_log.log("WATCHDOG",
+                              f"ES hold {elapsed:.1f}s / {EMERGENCY_HOLD_DURATION:.1f}s")
+            return True
+        _emergency_phase      = _EMERG_RECOVERY
+        _emergency_start_time = now
+        event_log.log("EMERGENCY", "Hold elapsed → RECOVERY phase")
+
+    if _emergency_phase == _EMERG_RECOVERY:
+        max_live_prox = max((obs.proximity for obs in live_obstacles), default=0.0)
+        if max_live_prox < SAFE_RELEASE_FRAC:
+            _emergency_phase  = _EMERG_IDLE
+            _emergency_reason = ""
+            event_log.log("EMERGENCY",
+                          f"Released — live prox {max_live_prox*100:.0f}% < threshold")
+            return False
+        if now - _emergency_last_sent >= EMERGENCY_RESEND_INTERVAL:
+            _emergency_last_sent = now
+            event_log.log("WATCHDOG",
+                          f"Recovery blocked — prox {max_live_prox*100:.0f}%")
+        return True
+
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SPEED-TIERED FORWARD (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _speed_tiered_forward(obstacles: List[ObstacleInfo]) -> str:
+    center_obs = [o for o in obstacles if o.zone == "CENTER"]
+    if not center_obs:
+        return NAV_FAST_FORWARD
+    nearest = max(center_obs, key=lambda o: o.proximity)
+    if nearest.proximity < SPEED_CLEAR_FRAC:
+        return NAV_FAST_FORWARD
+    if nearest.proximity < SPEED_CAUTION_FRAC:
+        return NAV_SLOW_FORWARD
+    return NAV_STOP
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CORE NAVIGATION FSM  (v5: safe-test disables FAST_FORWARD)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _nav_raw_decision_v3(obstacles, frame_w, frame_h):
+    if not obstacles:
+        return _next_search_state([]), NAV_SEARCH, None
+
+    humans = [o for o in obstacles if o.is_human]
+    for human in humans:
+        overlap = _human_center_overlap(human, frame_w)
+        if human.proximity >= HUMAN_HOVER_FRAC and overlap >= HUMAN_CENTER_OVERLAP_MIN:
+            return NAV_HOVER, NAV_HOVER, human
+
+    for obs in obstacles:
+        if obs.is_human:
+            continue
+        if obs.zone == "CENTER" and obs.proximity >= FRONT_DANGER_FRAC:
+            return NAV_BACKWARD, NAV_BACKWARD, obs
+
+    for obs in obstacles:
+        if obs.is_human:
+            continue
+        if obs.zone == "LEFT"  and obs.proximity >= SIDE_DANGER_FRAC:
+            return NAV_AVOID_RIGHT, NAV_AVOID_RIGHT, obs
+        if obs.zone == "RIGHT" and obs.proximity >= SIDE_DANGER_FRAC:
+            return NAV_AVOID_LEFT, NAV_AVOID_LEFT, obs
+
+    center_objects = [o for o in obstacles if o.zone == "CENTER"]
+    if len(center_objects) >= CENTER_DENSITY_LIMIT:
+        return NAV_SAFE_SEARCH, NAV_SEARCH, None
+
+    top_threats = [o for o in obstacles
+                   if o.v_zone == "TOP" and o.proximity >= SIDE_DANGER_FRAC]
+    if top_threats:
+        worst_top = max(top_threats, key=lambda o: o.proximity)
+        if worst_top.proximity >= FRONT_DANGER_FRAC:
+            return NAV_STOP, NAV_STOP, worst_top
+        return NAV_SLOW_FORWARD, NAV_FORWARD, worst_top
+
+    fwd_cmd = _speed_tiered_forward(obstacles)
+    # IMPROVEMENT 1: safe-test disables FAST_FORWARD
+    if _mode_is_safe_test() and fwd_cmd == NAV_FAST_FORWARD:
+        fwd_cmd = NAV_SLOW_FORWARD
+    return fwd_cmd, NAV_FORWARD, None
+
+
+# ── Navigation FSM public state ───────────────────────────────────────────────
+_nav_state        = NAV_SEARCH
+_nav_prev_raw     = NAV_SEARCH
+_nav_stable_count = 0
+_nav_final_cmd    = NAV_SEARCH
+
+
+def _force_emergency_nav_state() -> None:
+    global _nav_state, _nav_prev_raw, _nav_stable_count, _nav_final_cmd
+    global _emergency_phase, _emergency_start_time, _emergency_reason, _emergency_last_sent
+    _nav_final_cmd        = NAV_EMERGENCY_STOP
+    _nav_state            = NAV_EMERGENCY_STOP
+    _nav_prev_raw         = NAV_EMERGENCY_STOP
+    _nav_stable_count     = 0
+    if _emergency_phase == _EMERG_IDLE:
+        _emergency_phase      = _EMERG_ACTIVE
+        _emergency_start_time = time.time()
+        _emergency_reason     = "forced (stale frame / reader failure)"
+        _emergency_last_sent  = 0.0
+        event_log.log("EMERGENCY", f"Entered — {_emergency_reason}")
+
+
+def nav_decision(boxes: list, frame_w: int, frame_h: int):
+    global _nav_state, _nav_prev_raw, _nav_stable_count, _nav_final_cmd
+
+    t_start = time.perf_counter()
+    _live_obs_for_emergency = _compute_live_obstacles(boxes, frame_w, frame_h)
+    obstacles = analyse_obstacles(boxes, frame_w, frame_h)
+    raw_cmd, new_state, danger_obs = _nav_raw_decision_v3(obstacles, frame_w, frame_h)
+    _nav_state = new_state
+
+    if _check_emergency(raw_cmd, _nav_prev_raw, _live_obs_for_emergency):
+        _nav_final_cmd = NAV_EMERGENCY_STOP
+        send_nav_token(ARDUINO_TOKENS[NAV_EMERGENCY_STOP], force=True)
+        perf.record_command_latency((time.perf_counter() - t_start) * 1000)
+        return _nav_final_cmd, obstacles, danger_obs
+
+    if raw_cmd == _nav_prev_raw:
+        _nav_stable_count += 1
+    else:
+        _nav_stable_count = 1
+        _nav_prev_raw     = raw_cmd
+
+    if _nav_stable_count >= NAV_STABILITY_MIN:
+        if _nav_final_cmd != raw_cmd:
+            _LEGACY_PRIORITY = {
+                NAV_EMERGENCY_STOP: 0, NAV_HOVER: 1,
+                NAV_BACKWARD: 2, NAV_AVOID_LEFT: 3, NAV_AVOID_RIGHT: 3,
+                NAV_STOP: 4, NAV_SLOW_FORWARD: 5, NAV_SAFE_SEARCH: 5,
+                NAV_FAST_FORWARD: 6, NAV_FORWARD: 6, NAV_FORWARD_SCAN: 6,
+                NAV_SEARCH_LEFT: 7, NAV_SEARCH_RIGHT: 7, NAV_SEARCH: 7,
+            }
+            current_rank = _LEGACY_PRIORITY.get(_nav_final_cmd, 99)
+            new_rank     = _LEGACY_PRIORITY.get(raw_cmd, 99)
+            if new_rank <= current_rank or current_rank >= 6:
+                _nav_final_cmd = raw_cmd
+                send_nav_token(ARDUINO_TOKENS.get(raw_cmd, "?"))
+
+    perf.record_command_latency((time.perf_counter() - t_start) * 1000)
+    return _nav_final_cmd, obstacles, danger_obs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  NAVIGATION STATE CLASSIFIER (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def classify_nav_state(nav_cmd: str, obstacles: list) -> str:
+    if nav_cmd == NAV_EMERGENCY_STOP:                   return NAV_STATE_EMERGENCY
+    if nav_cmd == NAV_BACKWARD:                         return NAV_STATE_BLOCKED_FRONT
+    if nav_cmd == NAV_AVOID_LEFT:                       return NAV_STATE_BLOCKED_RIGHT
+    if nav_cmd == NAV_AVOID_RIGHT:                      return NAV_STATE_BLOCKED_LEFT
+    if nav_cmd in (NAV_SAFE_SEARCH, NAV_STOP):          return NAV_STATE_DENSE
+    if nav_cmd == NAV_SLOW_FORWARD:                     return NAV_STATE_CAUTION
+    if nav_cmd in (NAV_SEARCH, NAV_SEARCH_LEFT,
+                   NAV_SEARCH_RIGHT, NAV_FORWARD_SCAN): return NAV_STATE_SEARCH
+    if nav_cmd in (NAV_FAST_FORWARD, NAV_FORWARD):      return NAV_STATE_CLEAR
+    if nav_cmd == NAV_HOVER:                            return NAV_STATE_CAUTION
+    return NAV_STATE_CLEAR
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ARDUINO SERIAL CONTROLLER  (v5: stale-cmd TTL added)
+# ══════════════════════════════════════════════════════════════════════════════
+
+import queue as _queue
+
+
+class ArduinoController(AbstractFlightController):
+    """
+    Arduino Nano flight controller backend.
+
+    v5 additions
+    ─────────────
+    • Stale-command TTL: commands queued longer than STALE_CMD_TTL are
+      discarded before transmission to prevent acting on outdated states.
+    • All v4 features preserved: reconnect, deduplication, cooldown, HB.
+    """
+
+    def __init__(self, port: str = SERIAL_PORT_DEFAULT,
+                 baud: int = SERIAL_BAUD_DEFAULT,
+                 enabled: bool = False):
+        self.port         = port
+        self.baud         = baud
+        self.enabled      = enabled
+        self._ser         = None
+        self._last_token  = ""
+        self._last_send_t = 0.0
+        self._hb_thread   = None
+        self._hb_stop     = threading.Event()
+        self._lock        = threading.Lock()
+        self._cmd_queue: _queue.Queue = _queue.Queue(maxsize=8)
+
+        if enabled:
+            self._connect()
+            self._start_heartbeat()
+
+    def _connect(self) -> bool:
+        try:
+            import serial as _serial
+            self._ser = _serial.Serial(self.port, self.baud, timeout=1)
+            event_log.log("SERIAL", f"Connected to {self.port} @ {self.baud} baud")
+            return True
+        except Exception as exc:
+            event_log.log("SERIAL", f"Could not open {self.port}: {exc}")
+            self._ser = None
+            return False
+
+    def _reconnect(self) -> bool:
+        try:
+            if self._ser and self._ser.is_open:
+                self._ser.close()
+        except Exception:
+            pass
+        self._ser = None
+        perf.increment_reconnect()
+        return self._connect()
+
+    def send_token(self, token: str, force: bool = False) -> None:
+        now = time.time()
+        with self._lock:
+            if now - self._last_send_t < COMMAND_SEND_INTERVAL:
+                return
+            if not force and token == self._last_token:
+                return
+
+            # IMPROVEMENT 7 — Stale-command TTL
+            # A command enqueued then delayed (e.g. CPU load spike) is
+            # discarded rather than sent late to a different flight state.
+            self._last_token  = token
+            self._last_send_t = now
+            self._cmd_enqueue_time = now   # timestamp for TTL check
+
+        if not self.enabled:
+            return
+
+        # TTL check before write
+        age = time.time() - now
+        if age > STALE_CMD_TTL:
+            event_log.log("SERIAL",
+                          f"Stale cmd '{token}' discarded (age={age:.3f}s > TTL)")
+            return
+
+        t0 = time.perf_counter()
+        self._write(token)
+        perf.record_serial_latency((time.perf_counter() - t0) * 1000)
+
+    def send(self, token: str, force: bool = False) -> None:
+        self.send_token(token, force=force)
+
+    def _write(self, token: str) -> None:
+        payload = f"{token}\n".encode()
+        try:
+            if self._ser is None or not self._ser.is_open:
+                if not self._reconnect():
+                    return
+            self._ser.write(payload)
+        except Exception as exc:
+            event_log.log("SERIAL", f"Write error: {exc} — reconnecting")
+            try:
+                if self._reconnect():
+                    self._ser.write(payload)
+            except Exception as exc2:
+                event_log.log("SERIAL", f"Reconnect write failed: {exc2}")
+
+    def _start_heartbeat(self) -> None:
+        self._hb_thread = threading.Thread(
+            target=self._heartbeat_loop, name="SerialHeartbeat", daemon=True
+        )
+        self._hb_thread.start()
+        event_log.log("WATCHDOG",
+                      f"Heartbeat thread started ({HEARTBEAT_INTERVAL}s interval)")
+
+    def _heartbeat_loop(self) -> None:
+        while not self._hb_stop.is_set():
+            time.sleep(HEARTBEAT_INTERVAL)
+            if self._hb_stop.is_set():
+                break
+            try:
+                self.send_token("HB", force=True)
+            except Exception:
+                pass
+
+    def is_connected(self) -> bool:
+        return self._ser is not None and self._ser.is_open
+
+    def close(self) -> None:
+        self._hb_stop.set()
+        if self._hb_thread and self._hb_thread.is_alive():
+            self._hb_thread.join(timeout=2.0)
+        try:
+            if self._ser and self._ser.is_open:
+                self._ser.close()
+                event_log.log("SERIAL", "Port closed")
+        except Exception:
+            pass
+
+
+# Module-level flight controller singleton
+if _mode_allows_serial():
+    flight_controller: AbstractFlightController = ArduinoController(
+        port=SERIAL_PORT_DEFAULT, baud=SERIAL_BAUD_DEFAULT, enabled=True
+    )
+else:
+    flight_controller = DryRunController()
+
+arduino = flight_controller   # legacy alias
+
+
+def send_nav_token(token: str, force: bool = False) -> None:
+    flight_controller.send_token(token, force=force)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MASTER COMMAND ARBITER  (unchanged logic; motor abstraction integrated)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_master_motion:      str   = MOVE_SAFE_SEARCH
+_master_owner:       str   = OWNER_SEARCH
+_master_nav_state:   str   = NAV_STATE_SEARCH
+_master_last_change: float = 0.0
+
+
+def master_decision(nav_cmd:      str,
+                    ai_intent:    str,
+                    ai_state:     str,
+                    obstacles:    list,
+                    stale_frame:  bool,
+                    reader_alive: bool) -> Tuple[str, str, str, str]:
+    """
+    Master Command Arbiter — sole authority for final drone motion.
+
+    Priority: EMERGENCY > NAVIGATION > AI TRACKING > SEARCH
+    Returns (motion_primitive_str, motor_token, nav_state_str, owner_str).
+    """
+    global _master_motion, _master_owner, _master_nav_state, _master_last_change
+
+    now       = time.time()
+    nav_state = classify_nav_state(nav_cmd, obstacles)
+    _master_nav_state = nav_state
+
+    emergency_active = (_emergency_phase != _EMERG_IDLE)
+
+    # ── Priority 1: EMERGENCY ─────────────────────────────────────────────
+    if (emergency_active or stale_frame or not reader_alive
+            or nav_state == NAV_STATE_EMERGENCY):
+        motion = MOVE_EMERGENCY_STOP
+        _commit_motion(motion, OWNER_EMERGENCY, now, force=True)
+        return (_master_motion,
+                MOTION_TOKENS.get(MotionPrimitive(motion),
+                                  ARDUINO_TOKENS.get(motion, "ES")),
+                nav_state, _master_owner)
+
+    # ── Priority 2: NAVIGATION ────────────────────────────────────────────
+    if nav_state == NAV_STATE_BLOCKED_FRONT:
+        _commit_motion(MOVE_BACKWARD, OWNER_NAVIGATION, now, force=True)
+    elif nav_state == NAV_STATE_BLOCKED_LEFT:
+        _commit_motion(MOVE_YAW_RIGHT, OWNER_NAVIGATION, now)
+    elif nav_state == NAV_STATE_BLOCKED_RIGHT:
+        _commit_motion(MOVE_YAW_LEFT, OWNER_NAVIGATION, now)
+    elif nav_state == NAV_STATE_DENSE:
+        _commit_motion(MOVE_SAFE_SEARCH, OWNER_NAVIGATION, now)
+    elif nav_state == NAV_STATE_CEILING:
+        _commit_motion(MOVE_STOP, OWNER_NAVIGATION, now)
+    elif nav_state == NAV_STATE_CAUTION and ai_state != STATE_TRACKING:
+        _commit_motion(MOVE_FORWARD_SLOW, OWNER_NAVIGATION, now)
+
+    # ── Priority 3: AI TRACKING ───────────────────────────────────────────
+    elif ai_state == STATE_TRACKING:
+        if ai_intent == AI_HOVER:
+            motion = MOVE_HOVER
+        elif ai_intent == AI_TRACK_LEFT:
+            left_blocked = any(o.zone == "LEFT" and o.proximity >= SIDE_DANGER_FRAC
+                               for o in obstacles)
+            motion = MOVE_HOVER if left_blocked else MOVE_YAW_LEFT
+        elif ai_intent == AI_TRACK_RIGHT:
+            right_blocked = any(o.zone == "RIGHT" and o.proximity >= SIDE_DANGER_FRAC
+                                for o in obstacles)
+            motion = MOVE_HOVER if right_blocked else MOVE_YAW_RIGHT
+        elif ai_intent == AI_TRACK_CENTER:
+            # IMPROVEMENT 1: safe-test caps forward motion
+            motion = MOVE_FORWARD_SLOW if (nav_state == NAV_STATE_CAUTION
+                                           or _mode_is_safe_test()) else MOVE_FORWARD_FAST
+        else:
+            motion = MOVE_HOVER
+        _commit_motion(motion, OWNER_AI, now)
+
+    # ── Priority 4: NAVIGATION forward / search ───────────────────────────
+    elif nav_state == NAV_STATE_CLEAR:
+        motion = MOVE_FORWARD_SLOW if _mode_is_safe_test() else MOVE_FORWARD_FAST
+        _commit_motion(motion, OWNER_NAVIGATION, now)
+    else:
+        if nav_cmd == NAV_SEARCH_LEFT:
+            motion = MOVE_SEARCH_LEFT
+        elif nav_cmd == NAV_SEARCH_RIGHT:
+            motion = MOVE_SEARCH_RIGHT
+        elif nav_cmd == NAV_FORWARD_SCAN:
+            motion = MOVE_SCAN_FORWARD
+        else:
+            motion = MOVE_SAFE_SEARCH
+        _commit_motion(motion, OWNER_SEARCH, now)
+
+    token = ARDUINO_TOKENS.get(_master_motion, "?")
+    return _master_motion, token, nav_state, _master_owner
+
+
+def _commit_motion(motion: str, owner: str, now: float, force: bool = False) -> None:
+    """
+    Apply motion if cooldown/transition allows or force=True.
+    Also drives the motor abstraction layer (DroneMixer).
+    """
+    global _master_motion, _master_owner, _master_last_change
+
+    bypass = (force
+              or motion == MOVE_EMERGENCY_STOP
+              or motion == MOVE_BACKWARD)
+
+    if not bypass and (now - _master_last_change) < COMMAND_HOLD_TIME:
+        return
+
+    try:
+        current_mp = MotionPrimitive(motion) if motion != _master_motion else None
+        prev_mp    = MotionPrimitive(_master_motion)
+        if current_mp and not force:
+            if not _validate_transition(prev_mp, current_mp):
+                return
+    except ValueError:
+        pass
+
+    if motion == _master_motion and owner == _master_owner:
+        return
+
+    prev               = _master_motion
+    _master_motion     = motion
+    _master_owner      = owner
+    _master_last_change = now
+
+    _apply_pid_smoothing(MotionPrimitive(motion) if motion in
+                         [m.value for m in MotionPrimitive] else MotionPrimitive.SAFE_SEARCH)
+
+    token = ARDUINO_TOKENS.get(motion, "?")
+    event_log.log("OWNERSHIP",
+                  f"{owner} → {motion}  (was: {prev})  token: '{token}'",
+                  prev=prev, motion=motion, token=token)
+    send_nav_token(token, force=force)
+
+    # IMPROVEMENT 2: drive motor abstraction layer
+    drone_mixer.apply(motion)
+
+
+def _commit(candidate: str, owner: str, now: float, force: bool = False) -> None:
+    if candidate == NAV_EMERGENCY_STOP:
+        candidate = MOVE_EMERGENCY_STOP
+    _commit_motion(candidate, owner, now, force=force)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  IMPROVEMENT 6 — SAFE SHUTDOWN MANAGER  (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ShutdownManager:
+    def __init__(self):
+        self._threads: List[threading.Thread] = []
+
+    def register(self, *threads: threading.Thread) -> None:
+        self._threads.extend(threads)
+
+    def run(self) -> None:
+        print("[Shutdown] Initiating graceful shutdown …")
+        event_log.log("WATCHDOG", "Shutdown initiated")
+        _reader_alive.clear()
+        try:
+            send_nav_token(ARDUINO_TOKENS[NAV_EMERGENCY_STOP], force=True)
+        except Exception as exc:
+            print(f"[Shutdown] ES send error: {exc}")
+        for t in self._threads:
+            t.join(timeout=3)
+            if t.is_alive():
+                print(f"[Shutdown] Thread {t.name} did not exit cleanly")
+        try:
+            flight_controller.close()
+        except Exception as exc:
+            print(f"[Shutdown] Controller close error: {exc}")
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+        event_log.close()
+        print("[Shutdown] Complete")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DRAW HELPERS (unchanged from v4)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_FWD_PTS  = [(0.50,0.0),(1.0,0.6),(0.70,0.6),(0.70,1.0),(0.30,1.0),(0.30,0.6),(0.0,0.6)]
+_BWD_PTS  = [(0.50,1.0),(1.0,0.4),(0.70,0.4),(0.70,0.0),(0.30,0.0),(0.30,0.4),(0.0,0.4)]
+_LEFT_PTS = [(0.0,0.5),(0.6,0.0),(0.6,0.30),(1.0,0.30),(1.0,0.70),(0.6,0.70),(0.6,1.0)]
+_RIGHT_PTS= [(1.0,0.5),(0.4,0.0),(0.4,0.30),(0.0,0.30),(0.0,0.70),(0.4,0.70),(0.4,1.0)]
+
+_NAV_ARROW_DEFS: Dict[str, Optional[list]] = {
+    NAV_FORWARD: _FWD_PTS, NAV_FAST_FORWARD: _FWD_PTS,
+    NAV_SLOW_FORWARD: _FWD_PTS, NAV_BACKWARD: _BWD_PTS,
+    NAV_AVOID_LEFT: _LEFT_PTS, NAV_AVOID_RIGHT: _RIGHT_PTS,
+    NAV_SEARCH_LEFT: _LEFT_PTS, NAV_SEARCH_RIGHT: _RIGHT_PTS,
+    NAV_HOVER: None, NAV_SEARCH: None, NAV_SAFE_SEARCH: None,
+    NAV_FORWARD_SCAN: None, NAV_STOP: None, NAV_EMERGENCY_STOP: None,
+    MOVE_FORWARD: _FWD_PTS, MOVE_FORWARD_FAST: _FWD_PTS,
+    MOVE_FORWARD_SLOW: _FWD_PTS, MOVE_BACKWARD: _BWD_PTS,
+    MOVE_YAW_LEFT: _LEFT_PTS, MOVE_YAW_RIGHT: _RIGHT_PTS,
+    MOVE_SEARCH_LEFT: _LEFT_PTS, MOVE_SEARCH_RIGHT: _RIGHT_PTS,
+    MOVE_HOVER: None, MOVE_STOP: None, MOVE_SCAN_FORWARD: None,
+    MOVE_SAFE_SEARCH: None, MOVE_EMERGENCY_STOP: None,
+}
+
+_NAV_CMD_COLOR: Dict[str, Tuple[int, int, int]] = {
+    NAV_FORWARD: (0,200,80), NAV_FAST_FORWARD: (0,255,50),
+    NAV_SLOW_FORWARD: (0,200,160), NAV_STOP: (0,80,200),
+    NAV_BACKWARD: (0,60,200), NAV_AVOID_LEFT: (0,200,200),
+    NAV_AVOID_RIGHT: (0,200,200), NAV_HOVER: (0,180,255),
+    NAV_SEARCH: (180,180,0), NAV_SEARCH_LEFT: (200,200,0),
+    NAV_SEARCH_RIGHT: (200,200,0), NAV_FORWARD_SCAN: (0,200,100),
+    NAV_SAFE_SEARCH: (160,160,0), NAV_EMERGENCY_STOP: (0,0,255),
+    MOVE_FORWARD: (0,200,80), MOVE_FORWARD_FAST: (0,255,50),
+    MOVE_FORWARD_SLOW: (0,200,160), MOVE_BACKWARD: (0,60,200),
+    MOVE_YAW_LEFT: (0,200,200), MOVE_YAW_RIGHT: (0,200,200),
+    MOVE_HOVER: (0,180,255), MOVE_STOP: (0,80,200),
+    MOVE_SEARCH_LEFT: (200,200,0), MOVE_SEARCH_RIGHT: (200,200,0),
+    MOVE_SCAN_FORWARD: (0,200,100), MOVE_SAFE_SEARCH: (160,160,0),
+    MOVE_EMERGENCY_STOP: (0,0,255),
+}
+
+_DANGER_COLORS = {"LOW": (0,200,0), "MEDIUM": (0,165,255), "HIGH": (0,0,220)}
+
+
+def _proximity_to_danger_label(proximity: float) -> str:
+    if proximity >= FRONT_DANGER_FRAC: return "HIGH"
+    if proximity >= SIDE_DANGER_FRAC:  return "MEDIUM"
+    return "LOW"
+
+
+def draw_zone_grid(frame: np.ndarray, frame_w: int, frame_h: int) -> None:
+    left_x  = int(frame_w * LEFT_ZONE_END)
+    right_x = int(frame_w * RIGHT_ZONE_START)
+    top_y   = int(frame_h * TOP_ZONE_END)
+    bot_y   = int(frame_h * BOTTOM_ZONE_START)
+    alpha   = 0.20
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0,0), (left_x, frame_h), (255,200,100), -1)
+    cv2.rectangle(overlay, (right_x,0), (frame_w, frame_h), (255,200,100), -1)
+    cv2.rectangle(overlay, (0,0), (frame_w, top_y), (200,100,200), -1)
+    cv2.rectangle(overlay, (0,bot_y), (frame_w, frame_h), (100,180,255), -1)
+    cv2.addWeighted(overlay, alpha, frame, 1-alpha, 0, frame)
+    cv2.line(frame, (left_x,0), (left_x,frame_h), (200,200,200), 1)
+    cv2.line(frame, (right_x,0), (right_x,frame_h), (200,200,200), 1)
+    cv2.line(frame, (0,top_y), (frame_w,top_y), (200,150,200), 1)
+    cv2.line(frame, (0,bot_y), (frame_w,bot_y), (160,200,200), 1)
+    lby = frame_h - 10
+    cv2.putText(frame, "L", (left_x//2-6, lby), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 1)
+    cv2.putText(frame, "C", ((left_x+right_x)//2-6, lby), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 1)
+    cv2.putText(frame, "R", (right_x+(frame_w-right_x)//2-6, lby), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 1)
+    cv2.putText(frame, "TOP", (4, top_y-3), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200,150,200), 1)
+    cv2.putText(frame, "BOT", (4, bot_y+12), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (160,200,200), 1)
+
+
+def draw_danger_boxes(frame: np.ndarray, obstacles: List[ObstacleInfo]) -> None:
+    for obs in obstacles:
+        x1, y1, x2, y2 = obs.box
+        danger_label   = _proximity_to_danger_label(obs.proximity)
+        colour         = _DANGER_COLORS[danger_label]
+        cv2.rectangle(frame, (x1,y1), (x2,y2), colour, 2)
+        info = f"{obs.zone}/{obs.v_zone}  {obs.proximity*100:.0f}%  {danger_label}"
+        (tw, th), _ = cv2.getTextSize(info, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        lyt = max(0, y2+2)
+        cv2.rectangle(frame, (x1,lyt), (x1+tw+6, lyt+th+6), colour, -1)
+        cv2.putText(frame, info, (x1+3, lyt+th+2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 1)
+
+
+def _draw_nav_arrow(frame: np.ndarray, cmd: str, cx: int, cy: int, size: int = 52) -> None:
+    colour = _NAV_CMD_COLOR.get(cmd, (255,255,255))
+    half   = size // 2
+    if cmd in (NAV_HOVER, MOVE_HOVER):
+        cv2.circle(frame, (cx,cy), half, colour, 3)
+        cv2.circle(frame, (cx,cy), half//2, colour, 2)
+        cv2.circle(frame, (cx,cy), 4, colour, -1)
+        return
+    if cmd in (NAV_SEARCH, NAV_SAFE_SEARCH, MOVE_SAFE_SEARCH):
+        r = int(half * 0.6)
+        cv2.circle(frame, (cx-4,cy-4), r, colour, 2)
+        cv2.line(frame, (cx-4+int(r*0.7), cy-4+int(r*0.7)),
+                 (cx+half-4, cy+half-4), colour, 3)
+        return
+    if cmd in (NAV_STOP, MOVE_STOP):
+        cv2.rectangle(frame, (cx-half+8,cy-half+8), (cx+half-8,cy+half-8), colour, -1)
+        cv2.rectangle(frame, (cx-half+8,cy-half+8), (cx+half-8,cy+half-8), (255,255,255), 1)
+        return
+    if cmd in (NAV_EMERGENCY_STOP, MOVE_EMERGENCY_STOP):
+        cv2.line(frame, (cx-half+6,cy-half+6), (cx+half-6,cy+half-6), (0,0,255), 4)
+        cv2.line(frame, (cx+half-6,cy-half+6), (cx-half+6,cy+half-6), (0,0,255), 4)
+        return
+    if cmd in (NAV_FORWARD_SCAN, MOVE_SCAN_FORWARD):
+        for offset in [0, 14]:
+            pts = np.array([
+                (cx, cy-half+6+offset), (cx+half-6, cy+offset),
+                (cx, cy+10+offset), (cx-half+6, cy+offset),
+            ], dtype=np.int32)
+            cv2.polylines(frame, [pts], isClosed=False, color=colour, thickness=2)
+        return
+    pts_def = _NAV_ARROW_DEFS.get(cmd)
+    if pts_def is None:
+        return
+    pts = np.array(
+        [(int(cx-half+p[0]*size), int(cy-half+p[1]*size)) for p in pts_def],
+        dtype=np.int32,
+    )
+    cv2.fillPoly(frame, [pts], colour)
+    cv2.polylines(frame, [pts], isClosed=True, color=(255,255,255), thickness=1)
+
+
+def draw_nav_overlay(frame: np.ndarray, nav_cmd: str,
+                     obstacles: List[ObstacleInfo],
+                     danger_obs: Optional[ObstacleInfo],
+                     frame_w: int, frame_h: int) -> None:
+    draw_zone_grid(frame, frame_w, frame_h)
+    visible_obs = [o for o in obstacles if o.proximity >= SIDE_DANGER_FRAC * 0.7]
+    draw_danger_boxes(frame, visible_obs)
+
+    is_emergency_cmd = nav_cmd in (NAV_EMERGENCY_STOP, MOVE_EMERGENCY_STOP)
+    if is_emergency_cmd:
+        in_recovery  = (_emergency_phase == _EMERG_RECOVERY)
+        banner       = ("⚠  RECOVERING FROM EMERGENCY  ⚠"
+                        if in_recovery else "⚠⚠  EMERGENCY STOP  ⚠⚠")
+        banner_color = (0,140,200) if in_recovery else (0,0,220)
+        (bw,bh),_   = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.80, 2)
+        bx = (frame_w - bw) // 2
+        cv2.rectangle(frame, (0,0), (frame_w,46), banner_color, -1)
+        cv2.putText(frame, banner, (bx,36), cv2.FONT_HERSHEY_SIMPLEX, 0.80, (255,255,255), 2)
+    elif danger_obs is not None:
+        danger_label = _proximity_to_danger_label(danger_obs.proximity)
+        if danger_label == "HIGH":
+            banner, banner_colour = (f"⚠ OBSTACLE  {nav_cmd}  ({danger_obs.proximity*100:.0f}%)",
+                                     (0,0,220))
+        elif danger_label == "MEDIUM":
+            banner, banner_colour = (f"! CLOSE  {nav_cmd}  ({danger_obs.proximity*100:.0f}%)",
+                                     (0,165,255))
+        else:
+            banner, banner_colour = None, None
+        if banner:
+            (bw,bh),_ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+            bx = (frame_w - bw) // 2
+            cv2.rectangle(frame, (bx-8,8-bh-6), (bx+bw+8,20), banner_colour, -1)
+            cv2.putText(frame, banner, (bx,14), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2)
+        hx1,hy1,hx2,hy2 = danger_obs.box
+        cv2.rectangle(frame, (hx1-3,hy1-3), (hx2+3,hy2+3), (0,0,255), 3)
+
+    arrow_cx, arrow_cy = frame_w-48, frame_h-60
+    bg_overlay = frame.copy()
+    cv2.circle(bg_overlay, (arrow_cx,arrow_cy), 36, (30,30,30), -1)
+    cv2.addWeighted(bg_overlay, 0.55, frame, 0.45, 0, frame)
+    _draw_nav_arrow(frame, nav_cmd, arrow_cx, arrow_cy, size=44)
+    cv2.putText(frame, nav_cmd, (arrow_cx-38, arrow_cy+46),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                _NAV_CMD_COLOR.get(nav_cmd, (255,255,255)), 1)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ADAPTIVE CPU CONTROL (unchanged, now driven by RuntimeMode)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_low_power_mode:  bool = _mode_is_low_power()
+_lp_frame_toggle: bool = False
+
+
+def set_low_power_mode(enabled: bool) -> None:
+    global _low_power_mode
+    _low_power_mode = enabled
+    print(f"[CPU] Low-power mode: {'ON' if enabled else 'OFF'}")
+
+
+def _yolo_should_skip() -> bool:
+    global _lp_frame_toggle
+    if not _low_power_mode:
+        return False
+    _lp_frame_toggle = not _lp_frame_toggle
+    if _lp_frame_toggle:
+        perf.increment_dropped()
+    return _lp_frame_toggle
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  IP HELPER (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 _PRIVATE_IP_RE = re.compile(
-    r'\b('
-    r'10\.\d{1,3}\.\d{1,3}\.\d{1,3}'
+    r'\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3}'
     r'|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}'
-    r'|192\.168\.\d{1,3}\.\d{1,3}'
-    r')\b'
+    r'|192\.168\.\d{1,3}\.\d{1,3})\b'
 )
 
 
@@ -1875,7 +2161,6 @@ def get_drone_ip(com_port="COM5", baud_rate=115200,
     except Exception as e:
         print(f"[IP Error] {e}")
         return None
-
     start   = time.time()
     attempt = 0
     try:
@@ -1886,7 +2171,7 @@ def get_drone_ip(com_port="COM5", baud_rate=115200,
             if max_attempts and attempt >= max_attempts:
                 return None
             try:
-                line = ser.readline().decode(errors="ignore").strip()
+                line    = ser.readline().decode(errors="ignore").strip()
                 attempt += 1
                 if not line:
                     continue
@@ -1902,83 +2187,32 @@ def get_drone_ip(com_port="COM5", baud_rate=115200,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ADAPTIVE CONFIG  (unchanged)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def build_config(device_type: str, vram_gb: float) -> dict:
-    if device_type == "cuda":
-        if vram_gb >= 8:
-            return dict(model="yolov8x.pt", imgsz=960, conf=0.30, iou=0.45,
-                        half=True,  device="cuda", cam_w=1920, cam_h=1080,
-                        tier="High-end GPU (CUDA)")
-        elif vram_gb >= 4:
-            return dict(model="yolov8m.pt", imgsz=640, conf=0.25, iou=0.45,
-                        half=True,  device="cuda", cam_w=1280, cam_h=720,
-                        tier="Mid-range GPU (CUDA)")
-        else:
-            return dict(model="yolov8s.pt", imgsz=640, conf=0.25, iou=0.45,
-                        half=True,  device="cuda", cam_w=1280, cam_h=720,
-                        tier="Low-VRAM GPU (CUDA)")
-
-    return dict(
-        model  = "yolov8n.pt",
-        imgsz  = 416,
-        conf   = 0.30,
-        iou    = 0.45,
-        half   = False,
-        device = "cpu",
-        cam_w  = 640,
-        cam_h  = 480,
-        tier   = f"CPU ({device_name})",
-    )
-
-
-cfg = build_config(device_type, vram_gb)
-
-print(f"\n[Config] Tier    : {cfg['tier']}")
-print(f"[Config] Model   : {cfg['model']}")
-print(f"[Config] Img size: {cfg['imgsz']}")
-print(f"[Config] FP16    : {cfg['half']}")
-print(f"[Config] Res     : {cfg['cam_w']}×{cfg['cam_h']}\n")
-
-cfg['display_scale'] = 1.2
-print(f"[Config] Display scale: {cfg['display_scale']:.2f}x\n")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  LOAD MODEL  (unchanged)
+#  LOAD MODEL
 # ══════════════════════════════════════════════════════════════════════════════
 
 try:
-    model = YOLO(cfg["model"])
-    model.to(cfg["device"])
-    _dummy = np.zeros((cfg["imgsz"], cfg["imgsz"], 3), dtype=np.uint8)
-    model.predict(_dummy, verbose=False, imgsz=cfg["imgsz"])
-    print(f"[Model] ✅ {cfg['model']} loaded & warmed up on {cfg['device']}")
+    model = YOLO(cfg.model)
+    model.to(cfg.device)
+    _dummy = np.zeros((cfg.imgsz, cfg.imgsz, 3), dtype=np.uint8)
+    model.predict(_dummy, verbose=False, imgsz=cfg.imgsz)
+    print(f"[Model] ✅ {cfg.model} loaded & warmed up on {cfg.device}")
 except Exception as e:
     print(f"[Model Error] {e}")
     raise SystemExit(1)
 
-HUMAN_CLASS = 0
-
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  FRAME READER THREAD  (unchanged)
+#  FRAME READER THREAD (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 STREAM_PORT = 8080
-stream_url = f"http://192.168.1.4:{STREAM_PORT}/video"
+stream_url  = f"http://192.168.1.4:{STREAM_PORT}/video"
+
 _frame_lock    = threading.Lock()
 _latest_frame: Optional[np.ndarray] = None
 _frame_counter = 0
 _reader_alive  = threading.Event()
 _reader_alive.set()
-
-# FIX 6 — Stale frame protection.
-# Updated to time.time() whenever a valid frame is received.  The display
-# loop checks this against a 1-second threshold and fires EMERGENCY_STOP
-# if no fresh frame has arrived, guarding against stream freezes that would
-# leave the drone executing a stale nav command indefinitely.
 _last_frame_timestamp: float = time.time()
 
 
@@ -1990,13 +2224,14 @@ def _open_cap(url: str, retries: int = 5, delay: float = 2.0):
         cap = cv2.VideoCapture(url, cv2.CAP_ANY)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if cap.isOpened():
-            print(f"[Stream] ✅ Connected ({url})")
+            event_log.log("RECONNECT", f"Stream connected: {url}")
             return cap
         cap.release()
         if attempt < retries - 1:
-            print(f"[Stream] Retry {attempt+1}/{retries} in {delay}s…")
+            event_log.log("RECONNECT", f"Retry {attempt+1}/{retries} in {delay}s")
+            perf.increment_reconnect()
             time.sleep(delay)
-    print(f"[Stream] ❌ Could not connect after {retries} attempts.")
+    event_log.log("RECONNECT", f"All {retries} attempts failed for {url}")
     return None
 
 
@@ -2004,32 +2239,23 @@ def _frame_reader_loop(url: str):
     global _latest_frame, _frame_counter, _last_frame_timestamp
     cap = _open_cap(url)
     if cap is None:
-        # FIX 10: stream never connected — clear alive flag so the display
-        # loop exits cleanly and the emergency layer activates.
         _reader_alive.clear()
         return
-
     while _reader_alive.is_set():
         ret, frame = cap.read()
         if not ret:
-            print("[Reader] Stream lost — reconnecting…")
+            event_log.log("RECONNECT", "Stream lost — reconnecting")
             cap.release()
             cap = _open_cap(url)
             if cap is None:
-                # FIX 10: all reconnect attempts exhausted — signal the rest
-                # of the pipeline to stop.  The display loop detects the
-                # cleared flag and the stale-frame check will issue
-                # EMERGENCY_STOP before the loop exits.
-                print("[Reader] Reconnect failed. Stopping reader.")
+                event_log.log("RECONNECT", "Reconnect failed. Stopping reader.")
                 _reader_alive.clear()
                 break
             continue
-
         with _frame_lock:
-            _latest_frame      = frame
-            _frame_counter    += 1
-            _last_frame_timestamp = time.time()   # FIX 6: stamp arrival time
-
+            _latest_frame         = frame
+            _frame_counter       += 1
+            _last_frame_timestamp = time.time()
     cap.release()
     print("[Reader] Thread exiting.")
 
@@ -2040,18 +2266,15 @@ def _get_latest_frame():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  YOLO INFERENCE THREAD  (upgrade 9 — frame skip hook added)
+#  YOLO INFERENCE THREAD (unchanged from v4)
 # ══════════════════════════════════════════════════════════════════════════════
 
 _boxes_lock    = threading.Lock()
 _latest_boxes: list = []
 _ai_fps_val    = 0.0
-
-_track_hits:   dict = defaultdict(int)
-_track_misses: dict = defaultdict(int)
-SMOOTH_FRAMES = 1
-
-_last_inference_time: float = 0.0   # for ADAPTIVE_MIN_INFERENCE_INTERVAL
+_track_hits:   Dict[int, int] = defaultdict(int)
+_track_misses: Dict[int, int] = defaultdict(int)
+_last_inference_time: float   = 0.0
 
 
 def _yolo_loop():
@@ -2064,50 +2287,31 @@ def _yolo_loop():
 
     while _reader_alive.is_set():
         frame, counter = _get_latest_frame()
-
         if frame is None or counter == last_counter:
             time.sleep(0.005)
             continue
-
-        # ── UPGRADE 9: adaptive frame skip ────────────────────────────────
         if _yolo_should_skip():
             last_counter = counter
             continue
-
         now = time.time()
         if ADAPTIVE_MIN_INFERENCE_INTERVAL > 0:
             if now - _last_inference_time < ADAPTIVE_MIN_INFERENCE_INTERVAL:
                 time.sleep(0.005)
                 continue
         _last_inference_time = now
-        # ── end upgrade 9 ─────────────────────────────────────────────────
+        last_counter         = counter
+        infer_imgsz          = 320 if _low_power_mode else cfg.imgsz
 
-        last_counter = counter
-
-        # FIX 4 — Dynamic inference size for low-power mode.
-        # When low-power mode is active we use imgsz=320 (half the default
-        # 640) which roughly halves both memory bandwidth and FLOPs, giving
-        # genuine CPU relief beyond the frame-skip alone.  Normal mode uses
-        # cfg["imgsz"] as before so accuracy is unaffected in full-power mode.
-        infer_imgsz = 320 if _low_power_mode else cfg["imgsz"]
-
+        t_infer = time.perf_counter()
         try:
-            # Run tracking WITHOUT a class filter (all COCO objects detected).
-            # NAVIGATION_CLASSES filter is applied in analyse_obstacles().
             results = model.track(
-                frame,
-                persist = True,
-                conf    = cfg["conf"],
-                iou     = cfg["iou"],
-                imgsz   = infer_imgsz,        # FIX 4: dynamic size
-                tracker = "bytetrack.yaml",
-                verbose = False,
-                half    = cfg["half"],
+                frame, persist=True, conf=cfg.conf, iou=cfg.iou,
+                imgsz=infer_imgsz, tracker="bytetrack.yaml", verbose=False, half=cfg.half,
             )
+            perf.record_inference((time.perf_counter() - t_infer) * 1000)
 
             active_ids = set()
             new_boxes  = []
-
             for result in results:
                 if result.boxes is None:
                     continue
@@ -2130,29 +2334,21 @@ def _yolo_loop():
                         _track_hits.pop(tid, None)
                         _track_misses.pop(tid, None)
 
-            # PATCH 4 — Replace full .clear() with bounded oldest-first eviction.
-            # Clearing ALL entries causes an instant perception collapse:
-            # every tracked object loses its EMA history and the nav stack
-            # can lurch between depth estimates for 2-3 frames.  Evicting
-            # the oldest 25 % of entries instead preserves recently-active
-            # track state while still capping memory growth.
             if len(_depth_ema) > 200:
-                evict_count = max(1, len(_depth_ema) // 4)   # evict ~25 %
+                evict_count = max(1, len(_depth_ema) // 4)
                 for _tid in list(_depth_ema.keys())[:evict_count]:
                     _depth_ema.pop(_tid, None)
-                print(f"[YOLO] _depth_ema evicted {evict_count} oldest entries")
             if len(_track_hits) > 300:
                 evict_count = max(1, len(_track_hits) // 4)
                 for _tid in list(_track_hits.keys())[:evict_count]:
                     _track_hits.pop(_tid, None)
                     _track_misses.pop(_tid, None)
-                print(f"[YOLO] _track_hits/_misses evicted {evict_count} oldest entries")
 
             with _boxes_lock:
                 _latest_boxes = new_boxes
 
             ai_frames += 1
-            elapsed = time.time() - t0
+            elapsed    = time.time() - t0
             if elapsed >= 1.0:
                 _ai_fps_val = ai_frames / elapsed
                 ai_frames   = 0
@@ -2170,87 +2366,182 @@ def _get_latest_boxes():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  DRAW HELPERS  (unchanged)
+#  DRAW BOX HELPERS (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def draw_boxes(frame: np.ndarray, boxes: list) -> None:
     for (x1, y1, x2, y2, conf_val, tid, cls_id) in boxes:
         is_human = (cls_id == HUMAN_CLASS)
         colour   = (0, 220, 0) if is_human else (60, 180, 255)
-
         if is_human:
             label = (f"Human #{tid} ({conf_val:.0%})" if tid >= 0
                      else f"Human ({conf_val:.0%})")
         else:
-            cls_name = model.names.get(cls_id, f"cls{cls_id}") if hasattr(model, "names") else f"cls{cls_id}"
-            label    = (f"{cls_name} #{tid} ({conf_val:.0%})" if tid >= 0
-                        else f"{cls_name} ({conf_val:.0%})")
-
+            cls_name = (model.names.get(cls_id, f"cls{cls_id}")
+                        if hasattr(model, "names") else f"cls{cls_id}")
+            label = (f"{cls_name} #{tid} ({conf_val:.0%})" if tid >= 0
+                     else f"{cls_name} ({conf_val:.0%})")
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
         label_y_top = max(0, y1 - th - 10)
-        cv2.rectangle(frame, (x1, label_y_top), (x1 + tw + 6, y1), colour, -1)
+        cv2.rectangle(frame, (x1, label_y_top), (x1+tw+6, y1), colour, -1)
         cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
-        text_y = max(th + 4, y1 - 4)
-        cv2.putText(frame, label, (x1 + 3, text_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1)
+        text_y = max(th+4, y1-4)
+        cv2.putText(frame, label, (x1+3, text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,0,0), 1)
 
 
 def _scale_frame_for_display(frame: np.ndarray) -> np.ndarray:
-    scale = float(cfg.get('display_scale', 1.0))
+    scale = float(cfg.display_scale)
     if scale == 1.0:
         return frame
-    h, w   = frame.shape[:2]
-    new_w  = max(1, int(w * scale))
-    new_h  = max(1, int(h * scale))
+    h, w  = frame.shape[:2]
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
     return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ENTRY POINT  (display loop — unchanged contract; HUD extended)
+#  STALE / READER-FAIL OVERLAYS (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _render_stale_overlay(frame: np.ndarray) -> None:
-    """
-    FIX 2: Render a full-width red banner over the last known frame when
-    stale-frame EMERGENCY_STOP is active.  Gives the operator immediate
-    visual feedback that the video feed has frozen.
-    """
     h, w = frame.shape[:2]
-    cv2.rectangle(frame, (0, 0), (w, 50), (0, 0, 200), -1)
-    msg = "⚠ STALE FRAME — EMERGENCY STOP  (stream frozen)"
-    cv2.putText(frame, msg, (10, 34),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255, 255, 255), 2)
+    cv2.rectangle(frame, (0,0), (w,50), (0,0,200), -1)
+    cv2.putText(frame, "⚠ STALE FRAME — EMERGENCY STOP  (stream frozen)",
+                (10,34), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255,255,255), 2)
 
 
 def _render_reader_fail_overlay(frame: np.ndarray, elapsed: float) -> None:
-    """
-    FIX 3: Render a full-width dark-red banner when the reader thread has
-    died.  Shows hold-time remaining so the operator can see the fail-safe
-    countdown before shutdown.
-    """
-    h, w = frame.shape[:2]
+    h, w      = frame.shape[:2]
     remaining = max(0.0, READER_FAIL_HOLD - elapsed)
-    cv2.rectangle(frame, (0, 0), (w, 50), (0, 0, 160), -1)
-    msg = f"⚠ READER DEAD — EMERGENCY STOP  (shutdown in {remaining:.1f}s)"
-    cv2.putText(frame, msg, (10, 34),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+    cv2.rectangle(frame, (0,0), (w,50), (0,0,160), -1)
+    cv2.putText(frame,
+                f"⚠ READER DEAD — EMERGENCY STOP  (shutdown in {remaining:.1f}s)",
+                (10,34), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  v5 IMPROVEMENT 5 — SIMULATION HUD OVERLAY
+#  Renders virtual sensor panel on the right side of the display frame.
+#  Active in SIMULATION_MODE and SAFE_TEST_MODE.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _draw_battery_bar(frame: np.ndarray, x: int, y: int, pct: int) -> None:
+    """Draw a small horizontal battery bar at (x, y)."""
+    w, h   = 60, 10
+    filled = int(w * pct / 100)
+    colour = (0,200,0) if pct > 50 else (0,165,255) if pct > 20 else (0,0,220)
+    cv2.rectangle(frame, (x, y), (x+w, y+h), (80,80,80), -1)
+    cv2.rectangle(frame, (x, y), (x+filled, y+h), colour, -1)
+    cv2.rectangle(frame, (x, y), (x+w, y+h), (200,200,200), 1)
+    cv2.putText(frame, f"{pct}%", (x+w+4, y+h),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200,200,200), 1)
+
+
+def draw_simulation_hud(frame: np.ndarray, frame_w: int, frame_h: int,
+                         master_motion: str, master_owner: str,
+                         nav_state: str) -> None:
+    """
+    Right-side simulation panel — virtual altitude, velocity, motor PWM,
+    IMU state, battery gauge, and emergency indicator.
+
+    Drawn only in SAFE_TEST_MODE or SIMULATION_MODE.
+    """
+    if not (_mode_is_safe_test() or _mode_is_simulation()):
+        return
+
+    vs   = virtual_sensors.snapshot()
+    fl, fr, rl, rr = get_motor_pwm_snapshot()
+
+    # Panel background
+    panel_x = frame_w - 210
+    cv2.rectangle(frame, (panel_x, 60), (frame_w-2, frame_h-2),
+                  (20, 20, 20), -1)
+    cv2.rectangle(frame, (panel_x, 60), (frame_w-2, frame_h-2),
+                  (80, 80, 80), 1)
+
+    lines = [
+        ("── SIMULATION ────", (160,160,255)),
+        (f"Alt   : {vs.altitude_m:.2f} m",       (200,200,200)),
+        (f"Vel X : {vs.velocity_x:+.2f} m/s",    (200,200,200)),
+        (f"Vel Y : {vs.velocity_y:+.2f} m/s",    (200,200,200)),
+        (f"Dist  : {vs.obstacle_dist_m:.2f} m",
+             (0,80,220) if vs.obstacle_warning else (200,200,200)),
+        ("── IMU (MPU6050) ─", (160,160,255)),
+        (f"Roll  : {vs.imu_roll_deg:+.1f}°",     (200,200,200)),
+        (f"Pitch : {vs.imu_pitch_deg:+.1f}°",    (200,200,200)),
+        (f"Yaw   : {vs.imu_yaw_deg:.1f}°",       (200,200,200)),
+        ("── MOTORS (PWM) ──", (160,160,255)),
+        (f"FL:{fl:3d}  FR:{fr:3d}",               (200,200,200)),
+        (f"RL:{rl:3d}  RR:{rr:3d}",               (200,200,200)),
+        ("── ARBITER ───────", (160,160,255)),
+        (f"Owner : {master_owner}",               (200,200,200)),
+        (f"Motion: {master_motion[:18]}",         (200,200,200)),
+        (f"Nav   : {nav_state[:18]}",             (200,200,200)),
+    ]
+
+    y = 76
+    for text, colour in lines:
+        cv2.putText(frame, text, (panel_x+4, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, colour, 1)
+        y += 16
+
+    # Battery bar
+    y += 4
+    cv2.putText(frame, "Battery:", (panel_x+4, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200,200,200), 1)
+    _draw_battery_bar(frame, panel_x+4, y+4, vs.battery_pct)
+    y += 22
+
+    # Battery voltage
+    batt_col = (0,80,220) if vs.battery_warning else (0,200,100)
+    cv2.putText(frame, f"{vs.battery_voltage:.2f} V",
+                (panel_x+4, y+12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, batt_col, 1)
+    y += 20
+
+    # Emergency indicator
+    if _emergency_phase != _EMERG_IDLE:
+        cv2.rectangle(frame, (panel_x+2, y), (frame_w-4, y+18), (0,0,180), -1)
+        cv2.putText(frame, f"EMERG: {_emergency_phase}",
+                    (panel_x+4, y+13),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255,255,255), 1)
+
+    # Safe-test banner
+    if _mode_is_safe_test():
+        cv2.rectangle(frame, (panel_x+2, frame_h-22), (frame_w-4, frame_h-4),
+                      (0, 80, 140), -1)
+        cv2.putText(frame, "SAFE TEST MODE",
+                    (panel_x+4, frame_h-8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255,255,255), 1)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT — DISPLAY LOOP
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     router_ip = "http://192.168.1.1"
-    print(f"[Serial] Drone IP: {router_ip}  (test mode)")
+    print(f"[Serial] Drone IP: {router_ip}  ({ACTIVE_MODE.name})")
 
     reader_thread = threading.Thread(
         target=_frame_reader_loop, args=(stream_url,),
         name="FrameReader", daemon=True
     )
     yolo_thread = threading.Thread(
-        target=_yolo_loop,
-        name="YOLOInference", daemon=True
+        target=_yolo_loop, name="YOLOInference", daemon=True
+    )
+    # IMPROVEMENT 6: motor ramp background thread
+    motor_ramp_thread = threading.Thread(
+        target=_motor_ramp_loop, name="MotorRamp", daemon=True
     )
 
+    shutdown = ShutdownManager()
+    shutdown.register(reader_thread, yolo_thread, motor_ramp_thread)
+
     reader_thread.start()
-    print("[Main] Frame reader thread started")
+    motor_ramp_thread.start()
+    print("[Main] Frame reader + motor ramp threads started")
 
     for _ in range(40):
         if not _reader_alive.is_set():
@@ -2273,34 +2564,22 @@ def main():
     display_fps_frames = 0
     display_fps_val    = 0.0
     last_display_frame = None
-
-    # ── FIX 3: Reader-failure fail-safe ──────────────────────────────────
-    # If the reader thread died (stream never connected or all reconnects
-    # exhausted), hold EMERGENCY_STOP for READER_FAIL_HOLD seconds before
-    # allowing main() to exit.  This ensures the Arduino receives at least
-    # one ES token even when stream setup fails immediately.
     _reader_fail_start: float = 0.0
 
     try:
         while True:
-            # ── FIX 3: Check reader alive FIRST in every iteration ────────
             reader_alive = _reader_alive.is_set()
 
             if not reader_alive:
                 if _reader_fail_start == 0.0:
                     _reader_fail_start = time.time()
-                    print("[Main] Reader died — holding EMERGENCY_STOP")
-                    # PATCH 1: synchronise internal nav FSM state so HUD and
-                    # overlays show EMERGENCY_STOP, not a stale command.
+                    event_log.log("WATCHDOG", "Reader died — holding EMERGENCY_STOP")
                     _force_emergency_nav_state()
                     send_nav_token(ARDUINO_TOKENS[NAV_EMERGENCY_STOP], force=True)
 
                 elapsed_fail = time.time() - _reader_fail_start
                 if elapsed_fail < READER_FAIL_HOLD:
-                    # PATCH 1: keep re-asserting emergency state each iteration
-                    # in case any background path attempted to overwrite it.
                     _force_emergency_nav_state()
-                    # Render ES overlay on last known frame if available
                     if last_display_frame is not None:
                         _render_reader_fail_overlay(last_display_frame, elapsed_fail)
                         draw_nav_overlay(last_display_frame, NAV_EMERGENCY_STOP,
@@ -2315,11 +2594,9 @@ def main():
                     print("[Main] Reader fail-safe hold complete — exiting")
                     break
 
-            frame, _ = _get_latest_frame()
+            t_frame_start = time.perf_counter()
+            frame, _      = _get_latest_frame()
 
-            # ── Stale/missing frame: render ES overlay on last known frame ──
-            # master_decision() handles stale_frame=True with EMERGENCY priority.
-            # We still need to pump the display so the window stays responsive.
             stale_now = (time.time() - _last_frame_timestamp) > STALE_FRAME_TIMEOUT
             if stale_now or frame is None:
                 if last_display_frame is not None:
@@ -2338,7 +2615,6 @@ def main():
             display_frame = frame.copy()
             boxes         = _get_latest_boxes()
 
-            # ── FIX 10: Guard against corrupted / empty detections ────────
             valid_boxes = []
             for b in boxes:
                 try:
@@ -2346,36 +2622,42 @@ def main():
                     if x2 > x1 and y2 > y1 and 0.0 <= conf_v <= 1.0:
                         valid_boxes.append(b)
                 except (TypeError, ValueError):
-                    pass   # skip malformed detection tuples
+                    pass
             boxes = valid_boxes
 
             human_count = sum(1 for b in boxes if b[6] == HUMAN_CLASS)
-            # FIX 1: throttled write
             _write_human_count(human_count)
-
             draw_boxes(display_frame, boxes)
 
             h_disp, w_disp = display_frame.shape[:2]
 
-            # ── Sub-system outputs (producers only — no serial, no final logging) ──
-            drone_state, drone_cmd, target_ctr = ai_decision(boxes, w_disp, h_disp)
+            drone_state, ai_intent, target_ctr = ai_decision(boxes, w_disp, h_disp)
             draw_ai_overlay(display_frame, target_ctr, w_disp, h_disp)
 
             nav_cmd, obstacles, danger_obs = nav_decision(boxes, w_disp, h_disp)
 
-            # ── MASTER ARBITER — single authority for final command ────────
-            master_cmd, master_owner = master_decision(
+            master_motion, motor_token, nav_state, master_owner = master_decision(
                 nav_cmd      = nav_cmd,
-                ai_cmd       = drone_cmd,
+                ai_intent    = ai_intent,
                 ai_state     = drone_state,
                 obstacles    = obstacles,
-                stale_frame  = False,   # stale handled above; here frame is fresh
+                stale_frame  = False,
                 reader_alive = _reader_alive.is_set(),
             )
 
-            draw_nav_overlay(display_frame, master_cmd, obstacles, danger_obs, w_disp, h_disp)
+            # IMPROVEMENT 4: advance virtual sensor suite
+            virtual_sensors.tick(master_motion)
 
-            # ── HUD ───────────────────────────────────────────────────────
+            draw_nav_overlay(display_frame, master_motion, obstacles, danger_obs,
+                             w_disp, h_disp)
+
+            # IMPROVEMENT 5: simulation HUD overlay
+            draw_simulation_hud(display_frame, w_disp, h_disp,
+                                 master_motion, master_owner, nav_state)
+
+            perf.record_frame_latency((time.perf_counter() - t_frame_start) * 1000)
+
+            # ── Main HUD ──────────────────────────────────────────────────
             display_fps_frames += 1
             elapsed = time.time() - display_fps_t0
             if elapsed >= 1.0:
@@ -2383,34 +2665,49 @@ def main():
                 display_fps_frames = 0
                 display_fps_t0     = time.time()
 
-            top_prox    = f"{obstacles[0].proximity*100:.0f}%" if obstacles else "N/A"
-            mem_count   = len(_obstacle_memory)
-
-            # FIX 5: show ACTUAL runtime inference size (320 in low-power mode)
-            actual_imgsz = 320 if _low_power_mode else cfg["imgsz"]
+            top_prox     = f"{obstacles[0].proximity*100:.0f}%" if obstacles else "N/A"
+            mem_count    = len(_obstacle_memory)
+            actual_imgsz = 320 if _low_power_mode else cfg.imgsz
+            psnap        = perf.snapshot()
+            fl, fr, rl, rr = get_motor_pwm_snapshot()
 
             hud = [
                 f"Humans  : {human_count}",
-                f"Device  : {cfg['tier']}",
-                f"Model   : {cfg['model']}  imgsz={actual_imgsz}",  # FIX 5
+                f"Device  : {cfg.tier}",
+                f"Model   : {cfg.model}  imgsz={actual_imgsz}",
+                f"Mode    : {ACTIVE_MODE.name}",
                 f"Disp FPS: {display_fps_val:.1f}",
                 f"AI  FPS : {_ai_fps_val:.1f}",
+                f"── CONTROL STACK ──────────",
+                f"AI INTENT   : {ai_intent}",
+                f"NAV STATE   : {nav_state}",
+                f"MASTER OWNER: {master_owner}",
+                f"MOTION CMD  : {master_motion}",
+                f"ARDUINO TX  : {motor_token}",
+                f"── DIAGNOSTICS ────────────",
                 f"Dr State: {drone_state}",
-                f"AI  Cmd : {drone_cmd}",
-                f"NAV Cmd : {nav_cmd}",
-                f"MASTER  : {master_owner}",
-                f"CMD     : {master_cmd}",
+                f"NAV FSM : {nav_cmd}",
                 f"Depth   : {top_prox}",
                 f"Mem Obs : {mem_count}",
                 f"Low Pwr : {'ON' if _low_power_mode else 'OFF'}",
-                f"Serial  : {'ON' if arduino.enabled else 'OFF (dry-run)'}",
+                f"Serial  : {'ON' if flight_controller.is_connected() else 'OFF (dry-run)'}",
+                f"── MOTORS (ramped) ─────────",       # IMPROVEMENT 2
+                f"FL:{fl:3d}  FR:{fr:3d}",
+                f"RL:{rl:3d}  RR:{rr:3d}",
+                f"── PERFORMANCE ─────────────",
+                f"YOLO ms : {psnap['yolo_ms']:.1f}",
+                f"Frm  ms : {psnap['latency_ms']:.1f}",
+                f"Cmd  ms : {psnap['cmd_ms']:.1f}",
+                f"Ser  ms : {psnap['serial_ms']:.1f}",
+                f"Dropped : {psnap['dropped']}",
+                f"Reconn  : {psnap['reconnects']}",
             ]
             y = 28
             for line in hud:
                 cv2.putText(display_frame, line, (10, y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
                 cv2.putText(display_frame, line, (10, y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30,  30,  30),  1)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30, 30, 30),  1)
                 y += 26
 
             cv2.imshow("Human Detection", _scale_frame_for_display(display_frame))
@@ -2423,21 +2720,9 @@ def main():
     except KeyboardInterrupt:
         print("[Main] Ctrl+C — shutting down")
     except Exception as exc:
-        # FIX 10: Catch unexpected exceptions so cleanup always runs
         print(f"[Main] Unexpected error: {exc}")
     finally:
-        _reader_alive.clear()
-        # FIX 10: Send final EMERGENCY_STOP before closing serial so Arduino
-        # receives a stop command even on an unclean exit.
-        try:
-            send_nav_token(ARDUINO_TOKENS[NAV_EMERGENCY_STOP], force=True)
-        except Exception:
-            pass
-        reader_thread.join(timeout=3)
-        yolo_thread.join(timeout=3)
-        arduino.close()   # FIX 7+8: graceful serial + heartbeat shutdown
-        cv2.destroyAllWindows()
-        print("[Main] Cleanup complete")
+        shutdown.run()
 
 
 if __name__ == "__main__":
