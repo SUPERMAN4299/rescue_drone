@@ -67,7 +67,7 @@ DEFAULT_CFG = {
     "mode"       : "SAFE_TEST_MODE",
     "serial_port": "COM5",
     "baud"       : "115200",
-    "stream_url" : "http://192.168.1.5:8080/video",
+    "stream_url" : "http://192.168.1.2:8080/video",
     "model"      : "yolov8n.pt",
     "conf"       : "0.30",
     "imgsz"      : "416",

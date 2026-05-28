@@ -2558,7 +2558,7 @@ except Exception as e:
 # ══════════════════════════════════════════════════════════════════════════════
 
 STREAM_PORT = 8080
-stream_url  = f"http://192.168.1.5:{STREAM_PORT}/video"
+stream_url  = f"http://192.168.1.2:{STREAM_PORT}/video"
 
 _frame_lock    = threading.Lock()
 _latest_frame: Optional[np.ndarray] = None

@@ -352,9 +352,20 @@ class DroneConfig:
     danger_conf_threshold:         float = 0.72   # must reach this to trigger ES
     # IMPROVEMENT 7: camera-shake — optical-flow magnitude above this (px/frame)
     # enables shake-suppression mode; magnitude below exits it.
-    shake_flow_enter:              float = 14.0   # px/frame → suppression on
-    shake_flow_exit:               float = 6.0    # px/frame → suppression off
+    # v9: thresholds raised significantly to eliminate false positives from
+    # minor hand vibration / webcam movement (was enter=14, exit=6).
+    shake_flow_enter:              float = 45.0   # px/frame → minor-shake zone entry
+    shake_flow_exit:               float = 20.0   # px/frame → minor-shake zone exit
     shake_suppression_factor:      float = 0.55   # multiply ES proximity weight
+    # v9 FALSE-POSITIVE FIX: collision detection requires all of the below
+    collision_flow_threshold:      float = 60.0   # px/frame → potential collision zone
+    severe_collision_threshold:    float = 120.0  # px/frame → definite violent impact
+    collision_score_build:         float = 8.0    # confidence added per danger frame
+    collision_score_decay:         float = 4.0    # confidence removed per safe frame
+    collision_score_threshold:     float = 70.0   # confidence must reach this to fire
+    collision_flow_delta_min:      float = 15.0   # min acceleration (px) alongside flow
+    collision_cooldown_sec:        float = 2.0    # refractory period after clear
+    flow_smoothing_alpha:          float = 0.20   # EMA weight for current raw flow
 
     # ─────────────────────────────────────────────────────────────────────
     #  Hardware profiles (unchanged)
@@ -1171,9 +1182,18 @@ _BLUR_SUPPRESSION_DEC = cfg.blur_suppression_decay
 _DANGER_CONF_BUILD    = cfg.danger_conf_build_rate
 _DANGER_CONF_DECAY    = cfg.danger_conf_decay_rate
 _DANGER_CONF_THRESH   = cfg.danger_conf_threshold
-_SHAKE_FLOW_ENTER     = cfg.shake_flow_enter
-_SHAKE_FLOW_EXIT      = cfg.shake_flow_exit
-_SHAKE_SUPPRESSION    = cfg.shake_suppression_factor
+_SHAKE_FLOW_ENTER          = cfg.shake_flow_enter
+_SHAKE_FLOW_EXIT           = cfg.shake_flow_exit
+_SHAKE_SUPPRESSION         = cfg.shake_suppression_factor
+# ── v9 collision detection constants ─────────────────────────────────────────
+_COLLISION_FLOW_THRESH     = cfg.collision_flow_threshold
+_SEVERE_COLLISION_THRESH   = cfg.severe_collision_threshold
+_COLLISION_SCORE_BUILD     = cfg.collision_score_build
+_COLLISION_SCORE_DECAY     = cfg.collision_score_decay
+_COLLISION_SCORE_THRESHOLD = cfg.collision_score_threshold
+_COLLISION_FLOW_DELTA_MIN  = cfg.collision_flow_delta_min
+_COLLISION_COOLDOWN_SEC    = cfg.collision_cooldown_sec
+_FLOW_SMOOTHING_ALPHA      = cfg.flow_smoothing_alpha
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1503,63 +1523,111 @@ danger_confidence = DangerConfidenceAccumulator(
 )
 
 
-# ── IMPROVEMENT 7: Camera-Shake Detector ─────────────────────────────────────
+# ── IMPROVEMENT 7: Camera-Shake Detector (v9 false-positive hardened) ────────
 
 class CameraShakeDetector:
     """
     Estimates global camera motion using sparse optical flow (Lucas-Kanade)
     on a downscaled greyscale frame pair.
 
-    When the mean flow magnitude exceeds `shake_flow_enter` the detector
-    reports shake; it exits when magnitude drops below `shake_flow_exit`.
+    v9 FALSE-POSITIVE FIX — 8 improvements applied:
+    ────────────────────────────────────────────────
+    1. Raised thresholds:  minor shake <45px ignored, collision >60px,
+                           severe >120px.  (was enter=14 — far too sensitive)
+    2. EMA flow smoothing: α=0.20 applied before ALL decisions so single-
+                           frame optical-flow spikes cannot trigger anything.
+    3. Sustained motion:   10+ consecutive frames AND confidence score ≥ 70
+                           required (was 4 frames with no score gate).
+    4. Confidence scoring: 0–100 bucket — builds at 8/frame when dangerous,
+                           decays at 4/frame when safe.  Must reach 70.
+    5. Delta validation:   requires flow_delta ≥ 15px alongside high flow,
+                           so smooth slow-pan cannot trigger even at 60px.
+    6. Minor-shake suppression: 10–40px nuisance band suppressed for first
+                           1 second — classifies webcam vibration / hand
+                           wobble and ignores it.
+    7. Post-clear cooldown: 2-second refractory period after any emergency
+                           clear prevents rapid ENTER/EXIT spam loops.
+    8. Structured logging:  score logged every 10-point increment; no
+                           repeated per-frame ENTER/EXIT messages.
 
-    ── COLLISION EMERGENCY ESCALATION (new) ────────────────────────────────
-    If optical flow stays above `shake_flow_enter` for `collision_confirm_frames`
-    consecutive frames (default 4), the detector declares a COLLISION EMERGENCY:
+    Public API (unchanged from v8):
+        update(frame)                → call once per display frame
+        check_collision_emergency()  → True when confirmed collision active
+        suppression_factor()         → float in (0,1] for ES proximity scaling
+        is_shaking                   → bool (minor shake detected)
+        mean_flow                    → float (EMA-smoothed flow px/frame)
+        collision_consec_frames      → int  (HUD debug)
+        collision_active_elapsed     → float (seconds since emergency start)
+        collision_score              → float (0–100 current confidence)
 
-        check_collision_emergency() → True
-
-    The collision emergency stays active for at least `collision_hold_sec` seconds
-    (default 1.5) even if flow drops immediately (hysteresis / cooldown).
-    After the hold expires the emergency clears only when flow stays below
-    `shake_flow_exit` — preventing rapid ENTER/EXIT spam.
-
-    The collision emergency is independent of YOLO / human detection.  It fires
-    on raw optical-flow evidence alone so that wall / hand impacts are caught
-    even when no objects are tracked.
-
-    On hardware without OpenCV's optical flow (e.g. headless CPU) the
-    detector gracefully degrades — suppression_factor=1.0, no collision alarm.
+    On hardware without OpenCV's optical flow the detector gracefully
+    degrades — suppression_factor=1.0, no collision alarm.
     """
 
-    # ── Collision escalation defaults ─────────────────────────────────────
-    _COLLISION_CONFIRM_FRAMES: int   = 4    # consecutive high-flow frames needed
-    _COLLISION_HOLD_SEC:       float = 1.5  # minimum active duration (hysteresis)
+    _COLLISION_HOLD_SEC: float = 1.5  # minimum active duration (hysteresis)
 
-    def __init__(self, enter: float = 14.0, exit_: float = 6.0,
-                 suppression: float = 0.55):
-        self._enter       = enter
-        self._exit        = exit_
-        self._supp_val    = suppression
-        self._shaking     = False
+    def __init__(self,
+                 enter: float           = 45.0,
+                 exit_: float           = 20.0,
+                 suppression: float     = 0.55,
+                 collision_thresh: float  = 60.0,
+                 severe_thresh: float     = 120.0,
+                 score_build: float       = 8.0,
+                 score_decay: float       = 4.0,
+                 score_threshold: float   = 70.0,
+                 flow_delta_min: float    = 15.0,
+                 cooldown_sec: float      = 2.0,
+                 smoothing_alpha: float   = 0.20):
+
+        # ── Thresholds ────────────────────────────────────────────────────
+        self._enter            = enter            # minor-shake zone entry (px)
+        self._exit             = exit_            # minor-shake zone exit  (px)
+        self._supp_val         = suppression      # ES proximity multiplier
+        self._collision_thresh = collision_thresh # potential collision     (px)
+        self._severe_thresh    = severe_thresh    # definite impact         (px)
+        self._score_build      = score_build      # confidence per danger frame
+        self._score_decay      = score_decay      # confidence per safe frame
+        self._score_threshold  = score_threshold  # fire threshold (0–100)
+        self._flow_delta_min   = flow_delta_min   # min acceleration needed (px)
+        self._cooldown_sec     = cooldown_sec     # post-clear refractory (s)
+        self._alpha            = smoothing_alpha  # EMA weight for current flow
+
+        # ── Optical-flow state ────────────────────────────────────────────
+        self._shaking              = False
         self._prev_grey: Optional[np.ndarray] = None
-        self._mean_flow   = 0.0
-        self._lk_params   = dict(winSize=(15,15), maxLevel=2,
-                                  criteria=(cv2.TERM_CRITERIA_EPS |
-                                            cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+        self._raw_flow             = 0.0
+        self._mean_flow            = 0.0   # EMA-smoothed — used everywhere
+        self._prev_smoothed_flow   = 0.0   # previous tick smoothed value
+
+        self._lk_params = dict(winSize=(15, 15), maxLevel=2,
+                                criteria=(cv2.TERM_CRITERIA_EPS |
+                                          cv2.TERM_CRITERIA_COUNT, 10, 0.03))
         self._feature_params = dict(maxCorners=40, qualityLevel=0.3,
                                      minDistance=10, blockSize=7)
 
-        # ── Collision escalation state ─────────────────────────────────────
-        self._collision_consec:   int   = 0      # consecutive high-flow frames
-        self._collision_active:   bool  = False  # True while hold is in effect
-        self._collision_start_t:  float = 0.0   # wall-clock when collision confirmed
-        self._collision_hold_sec: float = self._COLLISION_HOLD_SEC
+        # ── Collision detection state ─────────────────────────────────────
+        self._collision_consec:        int   = 0
+        self._collision_active:        bool  = False
+        self._collision_start_t:       float = 0.0
+        self._collision_hold_sec:      float = self._COLLISION_HOLD_SEC
+        self._collision_score:         float = 0.0   # 0–100 confidence bucket
+        self._last_collision_clear_t:  float = 0.0   # cooldown reference point
 
-    def update(self, frame: np.ndarray) -> None:
+        # ── Minor-shake pattern state (req 6) ─────────────────────────────
+        self._minor_shake_active:  bool  = False
+        self._minor_shake_start_t: float = 0.0
+
+        # ── Log spam suppression (req 8) ──────────────────────────────────
+        self._last_log_score:     float = -1.0
+        self._log_score_bucket:   float = 10.0   # log once per 10-point step
+
+    # ── Internal: compute raw optical flow ───────────────────────────────
+
+    def _compute_raw_flow(self, frame: np.ndarray) -> Optional[float]:
         """
-        Call once per display frame.  Internally downscales to 160×120 for
-        speed.  Updates self._shaking, self._mean_flow, and collision state.
+        Downscale to 160×120, run Lucas-Kanade sparse flow, return median
+        magnitude scaled back to original resolution.  Returns None when
+        fewer than 4 feature points are available.
         """
         try:
             small = cv2.resize(frame, (160, 120), interpolation=cv2.INTER_NEAREST)
@@ -1567,100 +1635,200 @@ class CameraShakeDetector:
 
             if self._prev_grey is None:
                 self._prev_grey = grey
-                return
+                return None
 
             pts = cv2.goodFeaturesToTrack(self._prev_grey, **self._feature_params)
             if pts is None or len(pts) < 4:
                 self._prev_grey = grey
-                self._advance_collision_state(high_flow=False)
-                return
+                return None
 
             next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
                 self._prev_grey, grey, pts, None, **self._lk_params)
 
             good_old = pts[status == 1]
             good_new = next_pts[status == 1]
-
-            if len(good_old) < 4:
-                self._prev_grey = grey
-                self._advance_collision_state(high_flow=False)
-                return
-
-            flow = good_new - good_old
-            magnitudes = np.linalg.norm(flow, axis=1)
-            # Scale back to original resolution
-            scale = frame.shape[1] / 160.0
-            self._mean_flow = float(np.median(magnitudes) * scale)
-
-            # ── Shake enter/exit (unchanged) ──────────────────────────────
-            if self._shaking:
-                if self._mean_flow < self._exit:
-                    self._shaking = False
-                    event_log.log("WATCHDOG",
-                                  f"Shake detector: EXIT (flow={self._mean_flow:.1f}px)")
-            else:
-                if self._mean_flow > self._enter:
-                    self._shaking = True
-                    event_log.log("WATCHDOG",
-                                  f"Shake detector: ENTER (flow={self._mean_flow:.1f}px)")
-
-            # ── Collision escalation counter ──────────────────────────────
-            self._advance_collision_state(high_flow=self._mean_flow > self._enter)
-
             self._prev_grey = grey
 
+            if len(good_old) < 4:
+                return None
+
+            magnitudes = np.linalg.norm(good_new - good_old, axis=1)
+            scale      = frame.shape[1] / 160.0
+            return float(np.median(magnitudes) * scale)
+
         except Exception:
-            # Optical flow failure (e.g. greyscale conversion error) — silently skip
-            pass
+            return None
 
-    # ── Internal collision state machine ──────────────────────────────────
+    # ── Internal: minor-shake pattern check (req 6) ──────────────────────
 
-    def _advance_collision_state(self, high_flow: bool) -> None:
+    def _classify_minor_shake(self, flow: float) -> bool:
         """
-        Called every frame with whether flow is currently high.
-        Manages the consecutive-frame counter and the timed hold.
+        Returns True when flow sits in the 10–40px nuisance band for under
+        1 second — typical of hand vibration or desk wobble.
+        """
+        in_band = 10.0 <= flow <= 40.0
+        if in_band:
+            if not self._minor_shake_active:
+                self._minor_shake_active  = True
+                self._minor_shake_start_t = time.time()
+            return (time.time() - self._minor_shake_start_t) < 1.0
+        else:
+            self._minor_shake_active  = False
+            self._minor_shake_start_t = 0.0
+            return False
+
+    # ── Public: update ────────────────────────────────────────────────────
+
+    def update(self, frame: np.ndarray) -> None:
+        """
+        Call once per display frame.  Updates smoothed flow, shake flag,
+        collision confidence score, and collision-active state.
+        """
+        raw = self._compute_raw_flow(frame)
+        if raw is None:
+            # No usable flow data this frame — decay score, advance state
+            self._advance_collision_state(high_flow=False, delta=0.0)
+            return
+
+        self._raw_flow = raw
+
+        # ── Req 2: EMA smoothing — all further decisions use this value ───
+        self._mean_flow = (
+            self._alpha * raw
+            + (1.0 - self._alpha) * self._mean_flow
+        )
+        flow = self._mean_flow
+
+        # ── Req 5: motion delta (flow acceleration) ───────────────────────
+        flow_delta               = abs(flow - self._prev_smoothed_flow)
+        self._prev_smoothed_flow = flow
+
+        # ── Req 6: minor-shake suppression ───────────────────────────────
+        if self._classify_minor_shake(flow):
+            self._shaking = True   # mark as shaking (suppresses ES proximity)
+            event_log.log("WATCHDOG",
+                          f"Minor shake ignored "
+                          f"(flow={flow:.1f}px delta={flow_delta:.1f}px "
+                          f"dur={time.time() - self._minor_shake_start_t:.2f}s)")
+            self._advance_collision_state(high_flow=False, delta=flow_delta)
+            return
+
+        # ── Shake suppression flag (for ES proximity weighting) ───────────
+        # Uses the raised enter/exit thresholds — minor vibration no longer
+        # toggles this flag.
+        if self._shaking:
+            if flow < self._exit:
+                self._shaking = False
+        else:
+            if flow > self._enter:
+                self._shaking = True
+
+        # ── Req 1 + 5: collision zone — requires HIGH flow AND acceleration
+        # Severe flow (>= severe_thresh) bypasses the delta requirement since
+        # a violent impact is unambiguous.
+        if flow >= self._severe_thresh:
+            high_flow = True
+        elif flow >= self._collision_thresh and flow_delta >= self._flow_delta_min:
+            high_flow = True
+        else:
+            high_flow = False
+
+        self._advance_collision_state(high_flow=high_flow, delta=flow_delta)
+
+    # ── Internal: collision confidence + state machine ────────────────────
+
+    def _advance_collision_state(self, high_flow: bool, delta: float) -> None:
+        """
+        Manages the confidence score, consecutive-frame counter, timed hold,
+        and post-clear cooldown.  Called every frame via update().
         """
         now = time.time()
 
+        # ── Req 7: cooldown gate — no retrigger for cooldown_sec ─────────
+        if (not self._collision_active
+                and self._last_collision_clear_t > 0.0
+                and (now - self._last_collision_clear_t) < self._cooldown_sec):
+            if high_flow:
+                event_log.log("WATCHDOG",
+                              f"Motion spike filtered — cooldown active "
+                              f"({now - self._last_collision_clear_t:.1f}s / "
+                              f"{self._cooldown_sec:.1f}s)")
+            return
+
+        # ── Req 4: confidence score update ───────────────────────────────
+        if high_flow:
+            self._collision_score = min(100.0,
+                                        self._collision_score + self._score_build)
+        else:
+            self._collision_score = max(0.0,
+                                        self._collision_score - self._score_decay)
+
+        # ── Req 8: log score at 10-point increments (not every frame) ────
+        bucket     = int(self._collision_score / self._log_score_bucket)
+        last_bucket = int(self._last_log_score  / self._log_score_bucket)
+        if bucket != last_bucket and self._collision_score > 0.0:
+            event_log.log("WATCHDOG",
+                          f"Collision confidence: {self._collision_score:.0f}% "
+                          f"(flow={self._mean_flow:.1f}px "
+                          f"delta={delta:.1f}px "
+                          f"consec={self._collision_consec})")
+            self._last_log_score = self._collision_score
+
         if self._collision_active:
-            # Already in collision emergency — check if hold has expired
+            # ── ACTIVE: check whether hold has expired and flow calmed ────
             held = now - self._collision_start_t
             if held >= self._collision_hold_sec and not high_flow:
-                # Hold expired and flow is calm — clear the emergency
-                self._collision_active   = False
-                self._collision_consec   = 0
+                self._collision_active       = False
+                self._last_collision_clear_t = now
+                self._collision_consec       = 0
+                self._collision_score        = 0.0
+                self._last_log_score         = -1.0
                 event_log.log("WATCHDOG",
                               f"Collision emergency CLEARED "
-                              f"(held {held:.1f}s, flow={self._mean_flow:.1f}px)")
-            # else: keep active (hold still running or flow still high)
+                              f"(held {held:.1f}s, "
+                              f"flow={self._mean_flow:.1f}px)")
+            # else: hold still running or flow still high → stay active
+
         else:
             if high_flow:
                 self._collision_consec += 1
-                if self._collision_consec >= self._COLLISION_CONFIRM_FRAMES:
-                    # Confirmed collision — enter emergency
+
+                # ── Req 3: sustained motion check ─────────────────────────
+                # BOTH frame count AND confidence score must be satisfied.
+                if (self._collision_consec >= 10
+                        and self._collision_score >= self._score_threshold):
                     self._collision_active  = True
                     self._collision_start_t = now
                     self._collision_consec  = 0
                     event_log.log("WATCHDOG",
-                                  f"Emergency collision triggered — "
-                                  f"flow={self._mean_flow:.1f}px sustained "
-                                  f"{self._COLLISION_CONFIRM_FRAMES} frames")
+                                  f"Emergency collision CONFIRMED — "
+                                  f"flow={self._mean_flow:.1f}px "
+                                  f"score={self._collision_score:.0f}% "
+                                  f"sustained 10 frames")
+                elif self._collision_consec >= 4:
+                    # Informational only — not yet at threshold
+                    event_log.log("WATCHDOG",
+                                  f"Sustained violent motion detected "
+                                  f"({self._collision_consec}/10 frames "
+                                  f"score={self._collision_score:.0f}%)")
             else:
-                # Flow fell below threshold — reset counter (no false alarm)
+                # Decay consec counter slowly — a single calm frame does not
+                # reset it (prevents a 1-frame dip from restarting the count)
                 self._collision_consec = max(0, self._collision_consec - 1)
 
-    # ── Public API ────────────────────────────────────────────────────────
+    # ── Public API (interface identical to v8) ────────────────────────────
 
     def check_collision_emergency(self) -> bool:
         """
-        Returns True when a sustained high-flow collision has been confirmed
-        and the hold period is still active.  Independent of YOLO tracking.
+        Returns True when a confirmed sustained-flow collision is active
+        and the hold period has not yet expired.
+        Independent of YOLO / human detection.
         """
         return self._collision_active
 
     @property
     def collision_consec_frames(self) -> int:
-        """Current consecutive high-flow frame count (for HUD debug)."""
+        """Current consecutive high-flow frame count (for HUD / debug)."""
         return self._collision_consec
 
     @property
@@ -1671,15 +1839,25 @@ class CameraShakeDetector:
         return time.time() - self._collision_start_t
 
     @property
+    def collision_score(self) -> float:
+        """Current collision confidence score in range 0–100."""
+        return self._collision_score
+
+    @property
     def is_shaking(self) -> bool:
+        """True when smoothed flow exceeds the shake-entry threshold."""
         return self._shaking
 
     @property
     def mean_flow(self) -> float:
+        """EMA-smoothed optical flow magnitude in px/frame."""
         return self._mean_flow
 
     def suppression_factor(self) -> float:
-        """Returns _supp_val when shaking, 1.0 otherwise."""
+        """
+        Returns _supp_val (<1.0) when shaking, 1.0 otherwise.
+        Multiplied into ES proximity scores by _check_emergency().
+        """
         return self._supp_val if self._shaking else 1.0
 
 
@@ -1687,6 +1865,14 @@ camera_shake = CameraShakeDetector(
     enter=_SHAKE_FLOW_ENTER,
     exit_=_SHAKE_FLOW_EXIT,
     suppression=_SHAKE_SUPPRESSION,
+    collision_thresh=_COLLISION_FLOW_THRESH,
+    severe_thresh=_SEVERE_COLLISION_THRESH,
+    score_build=_COLLISION_SCORE_BUILD,
+    score_decay=_COLLISION_SCORE_DECAY,
+    score_threshold=_COLLISION_SCORE_THRESHOLD,
+    flow_delta_min=_COLLISION_FLOW_DELTA_MIN,
+    cooldown_sec=_COLLISION_COOLDOWN_SEC,
+    smoothing_alpha=_FLOW_SMOOTHING_ALPHA,
 )
 
 
@@ -3365,7 +3551,7 @@ except Exception as e:
 # ══════════════════════════════════════════════════════════════════════════════
 
 STREAM_PORT = 8080
-stream_url  = f"http://192.168.1.5:{STREAM_PORT}/video"
+stream_url  = f"http://192.168.1.2:{STREAM_PORT}/video"
 
 _frame_lock    = threading.Lock()
 _latest_frame: Optional[np.ndarray] = None
@@ -3645,7 +3831,9 @@ def draw_proximity_debug_overlay(
     supp_text = (f"BlurSupp:{blur_s:.2f}  ShakeFlow:{camera_shake.mean_flow:.1f}px  "
                  f"ShakeSupp:{shake_s:.2f}  Combined:{combined:.2f}  "
                  f"Blur={'ON' if blur_guard.is_suppressed else 'OFF'}  "
-                 f"Shake={'ON' if camera_shake.is_shaking else 'OFF'}")
+                 f"Shake={'ON' if camera_shake.is_shaking else 'OFF'}  "
+                 f"ColScore:{camera_shake.collision_score:.0f}%  "
+                 f"ColConsec:{camera_shake.collision_consec_frames}/10")
     cv2.putText(frame, supp_text, (4, frame_h - 50),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.32, s_col, 1)
 
