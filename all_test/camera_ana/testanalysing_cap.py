@@ -1,54 +1,3 @@
-"""
-analysing_cap_v5.py — Autonomous Drone Navigation Stack
-════════════════════════════════════════════════════════
-Safety & Simulation Pass (v5) over the v4 production system.
-
-Hardware platform (unchanged):
-  • Arduino Nano         — flight controller, ALL flight logic
-  • ESP32-CAM            — video streaming ONLY
-  • MPU6050              — gyro + accelerometer (stub interface)
-  • 4× brushed coreless motors
-  • SI2300 MOSFET drivers
-  • 3.7V LiPo battery
-  • 5V regulator
-
-What changed (v4 → v5):
-  1.  Safe-test mode            — reduced PWM, sensitive ES, hover-preferred
-  2.  Motor abstraction layer   — set_motor_speed(fl, fr, rl, rr) + DroneMixer
-  3.  PID hooks (roll/pitch/yaw)— PlaceholderPID dataclass; MPU6050 stub
-  4.  Virtual sensor framework  — VirtualSensorSuite (dist, alt, IMU, battery)
-  5.  Extended simulation HUD   — virtual alt, velocity, PWM, IMU, battery
-  6.  Motor safety limiter      — MAX_PWM_STEP, ramp_motor_pwm()
-  7.  Serial safety (v4→v5)     — already solid; added stale-cmd TTL + log
-  8.  AI stability filter       — command hold-time, confidence smoothing (v4 had stubs)
-  9.  Hardware-ready comments   — ToF / ultrasonic / IMU-fusion / coord-nav markers
-  10. Architecture preservation — YOLO, master arbiter, emergency FSM, obstacle
-                                  memory, pseudo-depth, search FSM, motion
-                                  primitives all kept verbatim.
-
-Architecture layers (unchanged):
-
-  PERCEPTION          camera frames  →  _frame_reader_loop / _yolo_loop
-       ↓
-  TARGET ESTIMATION   ai_decision()  →  AIIntent enum
-       ↓
-  AI INTENT           Layer 1        →  where is the target?
-       ↓
-  NAVIGATION REASONING nav_decision()→  NavState enum
-       ↓
-  MASTER ARBITER      master_decision() → single authority for motion
-       ↓
-  MOTION PRIMITIVES   MotionPrimitive enum → physical action
-       ↓
-  MOTOR ABSTRACTION   set_motor_speed()  → DroneMixer → PWM values   ← NEW v5
-       ↓
-  MOTOR SAFETY        ramp_motor_pwm()   → MAX_PWM_STEP limiter       ← NEW v5
-       ↓
-  HARDWARE ABSTRACTION AbstractFlightController → serial tokens
-       ↓
-  FLIGHT CONTROLLER   ArduinoController / DryRunController
-"""
-
 from __future__ import annotations
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -239,7 +188,9 @@ class DroneConfig:
     serial_baud:                int   = 115200
 
     # ── Stale-frame / reader fail-safe ────────────────────────────────────
-    stale_frame_timeout:        float = 1.0
+    # v10: raised 1.0 → 3.5 s — ESP32/IP streams can freeze briefly; a short
+    # lag must not trigger an emergency stop prematurely.
+    stale_frame_timeout:        float = 3.5
     reader_fail_hold:           float = 1.5
 
     # ── Master arbiter cooldown ───────────────────────────────────────────
@@ -255,7 +206,7 @@ class DroneConfig:
 
     # ── YOLO / camera ─────────────────────────────────────────────────────
     model:                      str   = "yolov8n.pt"
-    imgsz:                      int   = 416
+    imgsz:                      int   = 256   # v10: was 416 — faster CPU inference
     conf:                       float = 0.30
     iou:                        float = 0.45
     half:                       bool  = False
@@ -391,7 +342,7 @@ class DroneConfig:
 
     @classmethod
     def cpu_profile(cls, device_name: str = "CPU") -> "DroneConfig":
-        return cls(model="yolov8n.pt", imgsz=416, conf=0.30, iou=0.45,
+        return cls(model="yolov8n.pt", imgsz=256, conf=0.30, iou=0.45,  # v10: 416→256
                    half=False, device="cpu", cam_w=640, cam_h=480,
                    tier=f"CPU ({device_name})")
 
@@ -1602,7 +1553,7 @@ class CameraShakeDetector:
         self._lk_params = dict(winSize=(15, 15), maxLevel=2,
                                 criteria=(cv2.TERM_CRITERIA_EPS |
                                           cv2.TERM_CRITERIA_COUNT, 10, 0.03))
-        self._feature_params = dict(maxCorners=40, qualityLevel=0.3,
+        self._feature_params = dict(maxCorners=16, qualityLevel=0.3,  # v10: 40→16
                                      minDistance=10, blockSize=7)
 
         # ── Collision detection state ─────────────────────────────────────
@@ -1613,24 +1564,34 @@ class CameraShakeDetector:
         self._collision_score:         float = 0.0   # 0–100 confidence bucket
         self._last_collision_clear_t:  float = 0.0   # cooldown reference point
 
+        # ── Score-bucket logging state (req 8) ───────────────────────────
+        # _log_score_bucket: numeric divisor used by _advance_collision_state
+        # to determine when the score crosses a new 10-point boundary.
+        # _last_log_score: tracks the score value at the last log event so
+        # we can detect a bucket change without logging every frame.
+        self._log_score_bucket: float = 10.0   # log once per 10-point increment
+        self._last_log_score:   float = -1.0   # sentinel: no log yet this session
+
         # ── Minor-shake pattern state (req 6) ─────────────────────────────
         self._minor_shake_active:  bool  = False
         self._minor_shake_start_t: float = 0.0
 
-        # ── Log spam suppression (req 8) ──────────────────────────────────
-        self._last_log_score:     float = -1.0
-        self._log_score_bucket:   float = 10.0   # log once per 10-point step
+        # ── Minor-shake pattern state (req 6) ─────────────────────────────────
+        self._minor_shake_active:  bool  = False
+        self._minor_shake_start_t: float = 0.0
 
+        # ── Log spam suppression (req 6 throttle) ────────────────────────────
+        self._last_minor_shake_log_t: float = 0.0   # throttle: max 1 log per 0.5 s
     # ── Internal: compute raw optical flow ───────────────────────────────
 
     def _compute_raw_flow(self, frame: np.ndarray) -> Optional[float]:
         """
-        Downscale to 160×120, run Lucas-Kanade sparse flow, return median
-        magnitude scaled back to original resolution.  Returns None when
-        fewer than 4 feature points are available.
+        Downscale to 96×72 (v10: was 160×120), run Lucas-Kanade sparse flow,
+        return median magnitude scaled back to original resolution.  Returns
+        None when fewer than 4 feature points are available.
         """
         try:
-            small = cv2.resize(frame, (160, 120), interpolation=cv2.INTER_NEAREST)
+            small = cv2.resize(frame, (96, 72), interpolation=cv2.INTER_NEAREST)
             grey  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
             if self._prev_grey is None:
@@ -1653,7 +1614,7 @@ class CameraShakeDetector:
                 return None
 
             magnitudes = np.linalg.norm(good_new - good_old, axis=1)
-            scale      = frame.shape[1] / 160.0
+            scale      = frame.shape[1] / 96.0   # v10: updated divisor for new width
             return float(np.median(magnitudes) * scale)
 
         except Exception:
@@ -1704,12 +1665,16 @@ class CameraShakeDetector:
         self._prev_smoothed_flow = flow
 
         # ── Req 6: minor-shake suppression ───────────────────────────────
+        # AFTER
         if self._classify_minor_shake(flow):
-            self._shaking = True   # mark as shaking (suppresses ES proximity)
-            event_log.log("WATCHDOG",
-                          f"Minor shake ignored "
-                          f"(flow={flow:.1f}px delta={flow_delta:.1f}px "
-                          f"dur={time.time() - self._minor_shake_start_t:.2f}s)")
+            self._shaking = True
+            now_log = time.time()
+            if now_log - self._last_minor_shake_log_t >= 0.5:
+                self._last_minor_shake_log_t = now_log
+                event_log.log("WATCHDOG",
+                              f"Minor shake ignored "
+                              f"(flow={flow:.1f}px delta={flow_delta:.1f}px "
+                              f"dur={now_log - self._minor_shake_start_t:.2f}s)")
             self._advance_collision_state(high_flow=False, delta=flow_delta)
             return
 
@@ -3568,6 +3533,10 @@ def _open_cap(url: str, retries: int = 5, delay: float = 2.0):
     for attempt in range(retries):
         cap = cv2.VideoCapture(url, cv2.CAP_ANY)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Preserve full FOV (remove zoom effect) — explicitly do NOT set
+        # CAP_PROP_FRAME_WIDTH / CAP_PROP_FRAME_HEIGHT so OpenCV never crops
+        # or rescales the stream to a smaller resolution than the source.
+        # The stream's native resolution is used as-is.
         if cap.isOpened():
             event_log.log("RECONNECT", f"Stream connected: {url}")
             return cap
@@ -3586,17 +3555,42 @@ def _frame_reader_loop(url: str):
     if cap is None:
         _reader_alive.clear()
         return
+    # v10 Fix 6: retry counter — only reconnect after 5 consecutive read failures
+    # so a single dropped packet does not trigger a reconnect+emergency.
+    _read_fail_count: int = 0
     while _reader_alive.is_set():
         ret, frame = cap.read()
         if not ret:
-            event_log.log("RECONNECT", "Stream lost — reconnecting")
+            _read_fail_count += 1
+            if _read_fail_count < 5:
+                # Transient failure — wait briefly and retry before reconnecting
+                time.sleep(0.05)
+                continue
+            # 5 consecutive failures — now reconnect
+            event_log.log("RECONNECT",
+                          f"Stream lost after {_read_fail_count} retries — reconnecting")
             cap.release()
             cap = _open_cap(url)
             if cap is None:
                 event_log.log("RECONNECT", "Reconnect failed. Stopping reader.")
                 _reader_alive.clear()
                 break
+            _read_fail_count = 0
             continue
+        # Successful read — reset failure counter
+# Successful read — reset failure counter
+        _read_fail_count = 0
+
+        # Fix camera orientation — flip 180° to correct upside-down ESP32/webcam mount.
+        # Using flip(-1) = both axes, equivalent to cv2.rotate(ROTATE_180).
+        # Applied here (before storage) so YOLO thread and display both receive
+        # the corrected frame without any extra copies.
+        frame = cv2.flip(frame, cv2.ROTATE_180)
+
+        # Preserve full FOV (remove zoom effect) — do NOT resize or crop here.
+        # The frame is stored at native capture resolution so the full field of
+        # view reaches the detection pipeline.  Display scaling is handled
+        # separately in _scale_frame_for_display().
         with _frame_lock:
             _latest_frame         = frame
             _frame_counter       += 1
@@ -4003,6 +3997,9 @@ def main():
     display_fps_val    = 0.0
     last_display_frame = None
     _reader_fail_start: float = 0.0
+    # v10 Fix 2: require 8 consecutive stale ticks before declaring a stale
+    # emergency — transient stream freezes are absorbed without ES.
+    _stale_confirm_count: int = 0
 
     try:
         while True:
@@ -4037,8 +4034,12 @@ def main():
 
             stale_now = (time.time() - _last_frame_timestamp) > STALE_FRAME_TIMEOUT
             if stale_now or frame is None:
+                # v10 Fix 2: accumulate consecutive stale ticks; only trigger
+                # emergency once the count reaches 8 to absorb brief lag spikes.
+                _stale_confirm_count += 1
+                stale_emergency = _stale_confirm_count >= 8
                 if last_display_frame is not None:
-                    if stale_now:
+                    if stale_emergency:
                         _render_stale_overlay(last_display_frame)
                         _force_emergency_nav_state()
                         draw_nav_overlay(last_display_frame, NAV_EMERGENCY_STOP,
@@ -4049,6 +4050,8 @@ def main():
                 if cv2.waitKey(10) & 0xFF == ord('q'):
                     break
                 continue
+            # Good frame received — reset stale counter
+            _stale_confirm_count = 0
 
             display_frame = frame.copy()
             boxes         = _get_latest_boxes()
