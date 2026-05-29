@@ -15,6 +15,19 @@
 //   ROLL <f>      ±30°
 //   PITCH <f>     ±30°
 //   YAW <f>       ±30°/s
+//   PING          (zero-output keepalive — refreshes CMD_TO_MS watchdog)
+//   E             (collision-emergency backoff — 500 ms reverse burst)
+//
+// Integration patches applied (Python ↔ Arduino):
+//   PATCH A3 — PING command: zero-output keepalive beats CMD_TO_MS=2000 ms
+//              watchdog without flooding the 64-byte UART TX buffer that the
+//              original STATUS keepalive caused.
+//   PATCH A1 — E command: collision-emergency backoff handler.  Sets a
+//              nose-up pitch burst for BACKOFF_HOLD_MS then auto-reverts to
+//              level hover setpoints.  Python sends this when the camera-shake
+//              detector confirms a physical collision (MOVE_BACKOFF primitive).
+//   PATCH A4 — BACKOFF / BACKOFF_END: acknowledgement strings parsed by the
+//              Python telemetry loop to update self.telemetry["backoff"].
 
 #include <Wire.h>
 #include <math.h>
@@ -53,6 +66,14 @@
 
 // Telemetry at 5 Hz
 #define TELEM_TICKS    (LOOP_HZ / 5UL)
+
+// ── PATCH A1: BACKOFF (collision-emergency reverse burst) ─────────
+// Duration and setpoints for the "E" command handler.
+// Applied for BACKOFF_HOLD_MS, then automatically reset to hover.
+// Python sends "E" when camera_shake.check_collision_emergency() fires.
+#define BACKOFF_PITCH_DEG    22.0f   // nose-up → backward thrust
+#define BACKOFF_THROTTLE     70      // reduced throttle during reverse burst
+#define BACKOFF_HOLD_MS      500UL   // reverse burst duration (ms) then auto-hover
 
 // ── FILTER TUNING ────────────────────────────────────────────────
 //
@@ -178,6 +199,12 @@ static int mFL = 0, mFR = 0, mRR = 0, mRL = 0;
 
 typedef enum : uint8_t { DISARMED = 0, ARMED = 1 } State;
 volatile State flightState = DISARMED;
+
+// ── PATCH A1: backoff state ───────────────────────────────────────
+// Set by the "E" command handler; cleared automatically after
+// BACKOFF_HOLD_MS.  Checked at the top of loop() before PID runs.
+static bool           backoffActive  = false;
+static unsigned long  backoffStartMs = 0;
 
 // ── TIMING STATE ─────────────────────────────────────────────────
 
@@ -527,6 +554,44 @@ static void processCmd(const char* raw) {
     return;
   }
 
+  // ── PATCH A3: PING — zero-output keepalive ──────────────────────
+  // Python keepalive thread sends "PING\n" every 0.8 s to beat the
+  // CMD_TO_MS=2000 ms watchdog without producing any serial output.
+  // This prevents the 64-byte UART TX buffer from being saturated by
+  // frequent STATUS JSON responses (which were used in the original design).
+  // lastCmdMs is already refreshed at the top of processCmd() — no extra
+  // action needed.  Intentionally produces zero serial output.
+  if (strcmp_P(c, PSTR("PING")) == 0) {
+    // lastCmdMs already updated above — watchdog is satisfied.
+    // Zero output intentional: no Serial.print here.
+    return;
+  }
+
+  // ── PATCH A1: E — collision-emergency reverse burst ─────────────
+  // Python sends "E\n" when camera_shake.check_collision_emergency()
+  // fires (MOVE_BACKOFF primitive from the Master Command Arbiter).
+  //
+  // Behaviour:
+  //   1. Override setpoints: nose-up pitch + reduced throttle.
+  //   2. Set backoffActive = true and record start timestamp.
+  //   3. loop() auto-resets setpoints to hover after BACKOFF_HOLD_MS.
+  //   4. Send "BACKOFF\n" so Python _telemetry_loop can set
+  //      self.telemetry["backoff"] = True for HUD display.
+  //
+  // Safe in DISARMED state: setpoints are stored but motors stay off
+  // until ARM is sent.  checkFailsafes() still runs normally.
+  if (strcmp_P(c, PSTR("E")) == 0) {
+    sp_thr        = BACKOFF_THROTTLE;
+    sp_pitch      = BACKOFF_PITCH_DEG;   // nose-up → backward motion
+    sp_roll       = 0.0f;
+    sp_yaw        = 0.0f;
+    backoffActive  = true;
+    backoffStartMs = millis();
+    // PATCH A4: acknowledgement string — parsed by Python _telemetry_loop
+    Serial.println(F("BACKOFF"));
+    return;
+  }
+
   Serial.print(F("UNKNOWN: ")); Serial.println(raw);
 }
 
@@ -624,6 +689,22 @@ void loop() {
   }
 
   if (flightState == ARMED) checkFailsafes();
+
+  // ── PATCH A1: backoff auto-reset ─────────────────────────────────
+  // If an "E" command started the reverse burst and BACKOFF_HOLD_MS has
+  // elapsed, revert all setpoints to level hover and clear the flag.
+  // This runs every tick (250 Hz) so the reset is instant — no sub-task
+  // slot delay.  Runs in DISARMED state too so setpoints are clean if
+  // ARM arrives after the timer expires.
+  if (backoffActive && (millis() - backoffStartMs) >= BACKOFF_HOLD_MS) {
+    backoffActive = false;
+    sp_thr        = IDLE_THR;   // back to idle throttle
+    sp_pitch      = 0.0f;       // level nose
+    sp_roll       = 0.0f;
+    sp_yaw        = 0.0f;
+    // PATCH A4: notify Python that backoff has ended
+    Serial.println(F("BACKOFF_END"));
+  }
 
   float lr = sp_roll;
   float lp = sp_pitch;

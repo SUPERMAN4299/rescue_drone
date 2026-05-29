@@ -3581,11 +3581,8 @@ def _frame_reader_loop(url: str):
 # Successful read — reset failure counter
         _read_fail_count = 0
 
-        # Fix camera orientation — flip 180° to correct upside-down ESP32/webcam mount.
-        # Using flip(-1) = both axes, equivalent to cv2.rotate(ROTATE_180).
-        # Applied here (before storage) so YOLO thread and display both receive
-        # the corrected frame without any extra copies.
-        frame = cv2.flip(frame, cv2.ROTATE_180)
+
+        frame = cv2.flip(frame, 1)
 
         # Preserve full FOV (remove zoom effect) — do NOT resize or crop here.
         # The frame is stored at native capture resolution so the full field of

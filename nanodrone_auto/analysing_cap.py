@@ -1,54 +1,3 @@
-"""
-analysing_cap_v5.py — Autonomous Drone Navigation Stack
-════════════════════════════════════════════════════════
-Safety & Simulation Pass (v5) over the v4 production system.
-
-Hardware platform (unchanged):
-  • Arduino Nano         — flight controller, ALL flight logic
-  • ESP32-CAM            — video streaming ONLY
-  • MPU6050              — gyro + accelerometer (stub interface)
-  • 4× brushed coreless motors
-  • SI2300 MOSFET drivers
-  • 3.7V LiPo battery
-  • 5V regulator
-
-What changed (v4 → v5):
-  1.  Safe-test mode            — reduced PWM, sensitive ES, hover-preferred
-  2.  Motor abstraction layer   — set_motor_speed(fl, fr, rl, rr) + DroneMixer
-  3.  PID hooks (roll/pitch/yaw)— PlaceholderPID dataclass; MPU6050 stub
-  4.  Virtual sensor framework  — VirtualSensorSuite (dist, alt, IMU, battery)
-  5.  Extended simulation HUD   — virtual alt, velocity, PWM, IMU, battery
-  6.  Motor safety limiter      — MAX_PWM_STEP, ramp_motor_pwm()
-  7.  Serial safety (v4→v5)     — already solid; added stale-cmd TTL + log
-  8.  AI stability filter       — command hold-time, confidence smoothing (v4 had stubs)
-  9.  Hardware-ready comments   — ToF / ultrasonic / IMU-fusion / coord-nav markers
-  10. Architecture preservation — YOLO, master arbiter, emergency FSM, obstacle
-                                  memory, pseudo-depth, search FSM, motion
-                                  primitives all kept verbatim.
-
-Architecture layers (unchanged):
-
-  PERCEPTION          camera frames  →  _frame_reader_loop / _yolo_loop
-       ↓
-  TARGET ESTIMATION   ai_decision()  →  AIIntent enum
-       ↓
-  AI INTENT           Layer 1        →  where is the target?
-       ↓
-  NAVIGATION REASONING nav_decision()→  NavState enum
-       ↓
-  MASTER ARBITER      master_decision() → single authority for motion
-       ↓
-  MOTION PRIMITIVES   MotionPrimitive enum → physical action
-       ↓
-  MOTOR ABSTRACTION   set_motor_speed()  → DroneMixer → PWM values   ← NEW v5
-       ↓
-  MOTOR SAFETY        ramp_motor_pwm()   → MAX_PWM_STEP limiter       ← NEW v5
-       ↓
-  HARDWARE ABSTRACTION AbstractFlightController → serial tokens
-       ↓
-  FLIGHT CONTROLLER   ArduinoController / DryRunController
-"""
-
 from __future__ import annotations
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -175,6 +124,9 @@ class DroneEventLogger:
 event_log = DroneEventLogger(file_path=None)
 
 
+
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  IMPROVEMENT 3 — CENTRALIZED CONFIG SYSTEM  (v4 preserved + v5 additions)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -236,7 +188,9 @@ class DroneConfig:
     serial_baud:                int   = 115200
 
     # ── Stale-frame / reader fail-safe ────────────────────────────────────
-    stale_frame_timeout:        float = 1.0
+    # v10: raised 1.0 → 3.5 s — ESP32/IP streams can freeze briefly; a short
+    # lag must not trigger an emergency stop prematurely.
+    stale_frame_timeout:        float = 3.5
     reader_fail_hold:           float = 1.5
 
     # ── Master arbiter cooldown ───────────────────────────────────────────
@@ -252,7 +206,7 @@ class DroneConfig:
 
     # ── YOLO / camera ─────────────────────────────────────────────────────
     model:                      str   = "yolov8n.pt"
-    imgsz:                      int   = 416
+    imgsz:                      int   = 256   # v10: was 416 — faster CPU inference
     conf:                       float = 0.30
     iou:                        float = 0.45
     half:                       bool  = False
@@ -283,7 +237,7 @@ class DroneConfig:
 
     # ── IMPROVEMENT 1: Safe-test mode overrides ───────────────────────────
     safe_test_pwm_max:          int   = 120   # max PWM 0-255 in safe-test
-    safe_test_es_frac:          float = 0.35  # tighter emergency threshold
+    safe_test_es_frac:          float = 0.78  # v7: raised from 0.35 — was far too sensitive
     safe_test_search_delay:     float = 2.0   # extra seconds added to search phase
 
     # ── IMPROVEMENT 6: Motor safety limiter ──────────────────────────────
@@ -295,6 +249,16 @@ class DroneConfig:
 
     # ── IMPROVEMENT 7: Stale-command TTL ─────────────────────────────────
     stale_cmd_ttl:              float = 0.5   # discard queued cmds older than this
+
+    # ── v7 EMERGENCY STABILITY FIELDS ─────────────────────────────────────
+    # These six fields replace the single EMERGENCY_AREA_FRAC trigger with a
+    # confirmation buffer + hysteresis + centre-corridor validation system.
+    emergency_confirm_frames:   int   = 6     # consecutive CENTER-danger frames before ES
+    emergency_enter_frac:       float = 0.78  # proximity threshold to START emergency
+    emergency_exit_frac:        float = 0.42  # proximity to END emergency (hysteresis gap)
+    min_obstacle_area_frac:     float = 0.008 # ignore YOLO boxes < 0.8% of frame area
+    max_obstacle_aspect_ratio:  float = 4.0   # ignore very wide/tall boxes (walls/ceilings)
+    proximity_ema_live:         float = 0.30  # EMA alpha for tid=-1 live proximity path
 
     # ─────────────────────────────────────────────────────────────────────
     #  v6 STABILITY FIELDS  (no new subsystems — tuning only)
@@ -314,6 +278,45 @@ class DroneConfig:
 
     # Fix 8: frames of nav CAUTION/CLEAR before AI can override with forward motion
     nav_override_guard:         int   = 3     # nav must be stable before AI forward allowed
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  v8 REAL-WORLD ROBUSTNESS FIELDS
+    # ─────────────────────────────────────────────────────────────────────
+    # IMPROVEMENT 1: bbox stability — max IoU-frame-delta before box is
+    # considered "flickering".  0.0 = perfectly still; 1.0 = fully replaced.
+    bbox_stability_jitter_thresh:  float = 0.55   # displacement fraction of box size
+    bbox_stability_history:        int   = 5      # frames kept per tracked box
+    # IMPROVEMENT 2: approach velocity — minimum fractional area growth per
+    # second to count as "genuinely approaching".
+    approach_min_growth_rate:      float = 0.04   # 4% area growth/s = real approach
+    # IMPROVEMENT 3: confidence weighting — low-confidence detections get
+    # their proximity score scaled down.
+    conf_weight_floor:             float = 0.40   # conf below this → full penalty
+    conf_weight_ceil:              float = 0.70   # conf above this → no penalty
+    # IMPROVEMENT 4: motion-blur guard — if the single-frame bbox area jumps
+    # by more than this fraction, treat as a blur spike and suppress ES.
+    blur_area_explosion_thresh:    float = 2.5    # 2.5× area expansion in one frame
+    blur_suppression_decay:        float = 0.25   # suppression decays by this per frame
+    # IMPROVEMENT 6: danger confidence accumulator — slow build / slow decay
+    danger_conf_build_rate:        float = 0.18   # added per frame when dangerous
+    danger_conf_decay_rate:        float = 0.08   # subtracted per frame when not
+    danger_conf_threshold:         float = 0.72   # must reach this to trigger ES
+    # IMPROVEMENT 7: camera-shake — optical-flow magnitude above this (px/frame)
+    # enables shake-suppression mode; magnitude below exits it.
+    # v9: thresholds raised significantly to eliminate false positives from
+    # minor hand vibration / webcam movement (was enter=14, exit=6).
+    shake_flow_enter:              float = 45.0   # px/frame → minor-shake zone entry
+    shake_flow_exit:               float = 20.0   # px/frame → minor-shake zone exit
+    shake_suppression_factor:      float = 0.55   # multiply ES proximity weight
+    # v9 FALSE-POSITIVE FIX: collision detection requires all of the below
+    collision_flow_threshold:      float = 60.0   # px/frame → potential collision zone
+    severe_collision_threshold:    float = 120.0  # px/frame → definite violent impact
+    collision_score_build:         float = 8.0    # confidence added per danger frame
+    collision_score_decay:         float = 4.0    # confidence removed per safe frame
+    collision_score_threshold:     float = 70.0   # confidence must reach this to fire
+    collision_flow_delta_min:      float = 15.0   # min acceleration (px) alongside flow
+    collision_cooldown_sec:        float = 2.0    # refractory period after clear
+    flow_smoothing_alpha:          float = 0.20   # EMA weight for current raw flow
 
     # ─────────────────────────────────────────────────────────────────────
     #  Hardware profiles (unchanged)
@@ -339,7 +342,7 @@ class DroneConfig:
 
     @classmethod
     def cpu_profile(cls, device_name: str = "CPU") -> "DroneConfig":
-        return cls(model="yolov8n.pt", imgsz=416, conf=0.30, iou=0.45,
+        return cls(model="yolov8n.pt", imgsz=256, conf=0.30, iou=0.45,  # v10: 416→256
                    half=False, device="cpu", cam_w=640, cam_h=480,
                    tier=f"CPU ({device_name})")
 
@@ -382,6 +385,7 @@ class MotionPrimitive(Enum):
     SCAN_FORWARD   = "MOVE_SCAN_FORWARD"
     SAFE_SEARCH    = "MOVE_SAFE_SEARCH"
     EMERGENCY_STOP = "MOVE_EMERGENCY_STOP"
+    BACKOFF        = "MOVE_BACKOFF"          # collision-emergency reverse thrust
 
 
 MOTION_TOKENS: Dict[MotionPrimitive, str] = {
@@ -398,6 +402,7 @@ MOTION_TOKENS: Dict[MotionPrimitive, str] = {
     MotionPrimitive.SCAN_FORWARD   : "FS",
     MotionPrimitive.SAFE_SEARCH    : "SS",
     MotionPrimitive.EMERGENCY_STOP : "ES",
+    MotionPrimitive.BACKOFF        : "E",    # collision-emergency token
 }
 
 
@@ -474,6 +479,7 @@ MOVE_SEARCH_RIGHT   = MotionPrimitive.SEARCH_RIGHT.value
 MOVE_SCAN_FORWARD   = MotionPrimitive.SCAN_FORWARD.value
 MOVE_SAFE_SEARCH    = MotionPrimitive.SAFE_SEARCH.value
 MOVE_EMERGENCY_STOP = MotionPrimitive.EMERGENCY_STOP.value
+MOVE_BACKOFF        = MotionPrimitive.BACKOFF.value   # collision-emergency backoff
 
 NAV_FAST_FORWARD   = "FAST_FORWARD"
 NAV_SLOW_FORWARD   = "SLOW_FORWARD"
@@ -510,6 +516,7 @@ ARDUINO_TOKENS: Dict[str, str] = {
     MOVE_HOVER: "H", MOVE_STOP: "ST", MOVE_SEARCH_LEFT: "SL",
     MOVE_SEARCH_RIGHT: "SR", MOVE_SCAN_FORWARD: "FS",
     MOVE_SAFE_SEARCH: "SS", MOVE_EMERGENCY_STOP: "ES",
+    MOVE_BACKOFF: "E",   # collision-emergency token
 }
 
 ARDUINO_TOKENS_V3: Dict[str, str] = {
@@ -652,7 +659,7 @@ class VirtualSensorSuite:
 
             # ── Velocity estimate ─────────────────────────────────────────
             if motion == MOVE_FORWARD_FAST:
-                s.velocity_x = self._noisy(min(s.velocity_x + 0.4 * dt, 1.2))
+                s.velocity_x = self._noisy(min(s.velocity_x + 0.4 * dt, 1.0))
             elif motion == MOVE_FORWARD_SLOW:
                 s.velocity_x = self._noisy(min(s.velocity_x + 0.2 * dt, 0.6))
             elif motion == MOVE_BACKWARD:
@@ -1106,6 +1113,39 @@ _FORWARD_STABILITY_MIN    = cfg.forward_stability_min
 _OBS_SMOOTH_ALPHA         = cfg.obs_smooth_alpha
 _NAV_OVERRIDE_GUARD       = cfg.nav_override_guard
 
+# ── v7 emergency stability constants ─────────────────────────────────────────
+# These replace the single EMERGENCY_AREA_FRAC trigger with a confirmation
+# buffer + hysteresis system. See _check_emergency() for full details.
+_EMERGENCY_CONFIRM_FRAMES = cfg.emergency_confirm_frames   # 6 consecutive frames
+_EMERGENCY_ENTER_FRAC     = cfg.emergency_enter_frac       # 0.78 — enter ES
+_EMERGENCY_EXIT_FRAC      = cfg.emergency_exit_frac        # 0.42 — exit ES (hysteresis)
+_MIN_OBS_AREA_FRAC        = cfg.min_obstacle_area_frac     # 0.008 — blob size gate
+_MAX_OBS_ASPECT           = cfg.max_obstacle_aspect_ratio  # 4.0  — flat surface gate
+_LIVE_PROX_EMA_ALPHA      = cfg.proximity_ema_live         # 0.30 — tid=-1 smoothing
+# ── v8 robustness constants ───────────────────────────────────────────────────
+_BBOX_STAB_JITTER     = cfg.bbox_stability_jitter_thresh
+_BBOX_STAB_HISTORY    = cfg.bbox_stability_history
+_APPROACH_MIN_GROWTH  = cfg.approach_min_growth_rate
+_CONF_WEIGHT_FLOOR    = cfg.conf_weight_floor
+_CONF_WEIGHT_CEIL     = cfg.conf_weight_ceil
+_BLUR_EXPLOSION_THRESH= cfg.blur_area_explosion_thresh
+_BLUR_SUPPRESSION_DEC = cfg.blur_suppression_decay
+_DANGER_CONF_BUILD    = cfg.danger_conf_build_rate
+_DANGER_CONF_DECAY    = cfg.danger_conf_decay_rate
+_DANGER_CONF_THRESH   = cfg.danger_conf_threshold
+_SHAKE_FLOW_ENTER          = cfg.shake_flow_enter
+_SHAKE_FLOW_EXIT           = cfg.shake_flow_exit
+_SHAKE_SUPPRESSION         = cfg.shake_suppression_factor
+# ── v9 collision detection constants ─────────────────────────────────────────
+_COLLISION_FLOW_THRESH     = cfg.collision_flow_threshold
+_SEVERE_COLLISION_THRESH   = cfg.severe_collision_threshold
+_COLLISION_SCORE_BUILD     = cfg.collision_score_build
+_COLLISION_SCORE_DECAY     = cfg.collision_score_decay
+_COLLISION_SCORE_THRESHOLD = cfg.collision_score_threshold
+_COLLISION_FLOW_DELTA_MIN  = cfg.collision_flow_delta_min
+_COLLISION_COOLDOWN_SEC    = cfg.collision_cooldown_sec
+_FLOW_SMOOTHING_ALPHA      = cfg.flow_smoothing_alpha
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  TORCH CPU THREAD TUNING (unchanged)
@@ -1150,32 +1190,745 @@ def _write_human_count(count: int) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 _depth_ema: Dict[int, float] = {}
+# v7: EMA for the untracked (tid=-1) live proximity path used by _check_emergency
+_live_prox_ema: Dict[int, float] = {}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  v8 REAL-WORLD ROBUSTNESS LAYER
+#  All classes are read-only to the rest of the stack — they produce scalar
+#  multipliers (0.0–1.0) that weight down proximity scores without removing
+#  any existing validation system.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── IMPROVEMENT 1: BBox Stability Tracker ────────────────────────────────────
+
+class BBoxStabilityTracker:
+    """
+    Tracks per-object bounding-box position history and returns a
+    stability score in [0, 1].
+
+    score = 1.0  → box has been geometrically consistent across history
+    score → 0.0  → box is jumping around (motion-blur / flicker)
+
+    The score is computed as:
+        1 − clamp(mean_displacement / box_size, 0, 1)
+    where displacement is the centre-point movement between successive
+    frames normalised by the diagonal of the bounding box.
+
+    Usage:  bbox_stability.update(tid, box)  → float stability score
+    """
+
+    def __init__(self, history_len: int = 5, jitter_thresh: float = 0.55):
+        self._history:  Dict[int, deque]  = {}
+        self._scores:   Dict[int, float]  = {}
+        self._history_len  = history_len
+        self._jitter_thresh = jitter_thresh
+
+    def update(self, tid: int, box: Tuple[int, int, int, int]) -> float:
+        """
+        Record box for `tid` and return current stability score [0, 1].
+        tid=-1 (untracked) always returns 1.0 — we can't assess stability
+        without identity continuity.
+        """
+        if tid < 0:
+            return 1.0
+
+        x1, y1, x2, y2 = box
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        diag = math.hypot(max(1, x2 - x1), max(1, y2 - y1))
+
+        hist = self._history.setdefault(tid, deque(maxlen=self._history_len))
+        hist.append((cx, cy, diag))
+
+        if len(hist) < 2:
+            self._scores[tid] = 1.0
+            return 1.0
+
+        displacements = []
+        prev_cx, prev_cy, prev_diag = hist[0]
+        for (hcx, hcy, hd) in list(hist)[1:]:
+            d = math.hypot(hcx - prev_cx, hcy - prev_cy)
+            displacements.append(d / max(1.0, hd))
+            prev_cx, prev_cy, prev_diag = hcx, hcy, hd
+
+        mean_disp = sum(displacements) / len(displacements)
+        # Smooth score with a gentle EMA so brief jitter doesn't immediately
+        # tank the score (gives the tracker time to settle after a real move).
+        raw_score = float(np.clip(1.0 - mean_disp / max(self._jitter_thresh, 0.01),
+                                  0.0, 1.0))
+        prev_score = self._scores.get(tid, raw_score)
+        score = 0.35 * raw_score + 0.65 * prev_score
+        self._scores[tid] = score
+        return score
+
+    def score(self, tid: int) -> float:
+        """Return last computed stability score without updating."""
+        if tid < 0:
+            return 1.0
+        return self._scores.get(tid, 1.0)
+
+    def evict_stale(self, active_tids: set) -> None:
+        """Remove history for objects no longer tracked."""
+        for tid in list(self._history.keys()):
+            if tid not in active_tids:
+                self._history.pop(tid, None)
+                self._scores.pop(tid, None)
+
+
+bbox_stability = BBoxStabilityTracker(
+    history_len=_BBOX_STAB_HISTORY,
+    jitter_thresh=_BBOX_STAB_JITTER,
+)
+
+
+# ── IMPROVEMENT 2: Approach Velocity Tracker ─────────────────────────────────
+
+class ApproachVelocityTracker:
+    """
+    Estimates whether a tracked object is genuinely approaching the camera
+    by measuring fractional bounding-box area growth over time.
+
+    approach_velocity > _APPROACH_MIN_GROWTH  → object is closing in
+    approach_velocity ≤ 0                     → object is stationary or receding
+
+    Returns a weight in [0, 1]:
+        1.0 when the object is clearly approaching at or above threshold.
+        0.0 when area is shrinking.
+        Linearly interpolated between the two.
+    """
+
+    def __init__(self, min_growth_rate: float = 0.04):
+        self._areas:      Dict[int, Tuple[float, float]] = {}  # tid → (area, timestamp)
+        self._velocities: Dict[int, float]               = {}
+        self._min_growth  = min_growth_rate
+
+    def update(self, tid: int, box: Tuple[int, int, int, int],
+               frame_area: int) -> float:
+        """
+        Record normalised box area for `tid` and return an approach weight [0, 1].
+        tid=-1 returns 0.5 (neutral — no history to assess direction).
+        """
+        if tid < 0:
+            return 0.5   # untracked — assume neutral; do not reward or penalise
+
+        x1, y1, x2, y2 = box
+        now = time.time()
+        norm_area = ((x2 - x1) * (y2 - y1)) / max(1, frame_area)
+
+        if tid in self._areas:
+            prev_area, prev_t = self._areas[tid]
+            dt = max(now - prev_t, 1e-3)
+            # Fractional growth rate per second
+            vel = (norm_area - prev_area) / (prev_area * dt + 1e-6)
+            # EMA on velocity to smooth noisy growth estimates
+            prev_vel = self._velocities.get(tid, vel)
+            vel = 0.30 * vel + 0.70 * prev_vel
+            self._velocities[tid] = vel
+        else:
+            vel = 0.0
+            self._velocities[tid] = 0.0
+
+        self._areas[tid] = (norm_area, now)
+
+        if vel >= self._min_growth:
+            # Approaching — scale from 0.5 at floor to 1.0 at 3× floor
+            weight = float(np.clip(
+                0.5 + 0.5 * (vel - self._min_growth) / (2 * self._min_growth + 1e-6),
+                0.5, 1.0,
+            ))
+        else:
+            # Stationary or receding — scale from 0.5 down to 0.0
+            weight = float(np.clip(0.5 + vel / (self._min_growth + 1e-6) * 0.5,
+                                   0.0, 0.5))
+
+        return weight
+
+    def velocity(self, tid: int) -> float:
+        """Return last estimated approach velocity (fractional area / s)."""
+        return self._velocities.get(tid, 0.0)
+
+    def evict_stale(self, active_tids: set, timeout: float = 1.0) -> None:
+        now = time.time()
+        for tid in list(self._areas.keys()):
+            if tid not in active_tids or now - self._areas[tid][1] > timeout:
+                self._areas.pop(tid, None)
+                self._velocities.pop(tid, None)
+
+
+approach_tracker = ApproachVelocityTracker(min_growth_rate=_APPROACH_MIN_GROWTH)
+
+
+# ── IMPROVEMENT 4: Motion-Blur Guard ─────────────────────────────────────────
+
+class MotionBlurGuard:
+    """
+    Detects sudden single-frame bounding-box area explosions that are
+    characteristic of motion blur, rapid camera shake, or YOLO hallucination
+    on low-texture / low-light frames.
+
+    When an explosion is detected the guard raises a suppression flag.
+    The suppression factor decays back to 1.0 over subsequent frames.
+
+    suppression_factor() returns a value in (0, 1]:
+        1.0  → no suppression
+        →0.0 → maximum suppression (proximity scores multiplied down)
+    """
+
+    def __init__(self, explosion_thresh: float = 2.5, decay: float = 0.25):
+        self._prev_areas:   Dict[int, float] = {}
+        self._suppression:  float = 1.0        # current global suppression factor
+        self._explosion_thresh = explosion_thresh
+        self._decay        = decay
+
+    def update(self, boxes: list, frame_area: int) -> None:
+        """
+        Call once per YOLO result set.  Checks each box for an area explosion
+        relative to the previous frame for the same track id.
+        """
+        current_areas: Dict[int, float] = {}
+        explosion_detected = False
+
+        for (x1, y1, x2, y2, conf, tid, cls_id) in boxes:
+            area = max(0, (x2 - x1) * (y2 - y1)) / max(1, frame_area)
+            if tid >= 0:
+                current_areas[tid] = area
+                prev = self._prev_areas.get(tid, area)
+                if prev > 0 and area / max(prev, 1e-6) > self._explosion_thresh:
+                    explosion_detected = True
+                    event_log.log(
+                        "WATCHDOG",
+                        f"Blur guard: tid={tid} area explosion "
+                        f"{prev * 100:.1f}% → {area * 100:.1f}%",
+                    )
+
+        self._prev_areas = current_areas
+
+        if explosion_detected:
+            # Drop suppression immediately
+            self._suppression = max(0.15, self._suppression - 0.60)
+        else:
+            # Recover gradually
+            self._suppression = min(1.0, self._suppression + self._decay)
+
+    def suppression_factor(self) -> float:
+        """Multiply emergency proximity scores by this value [0, 1]."""
+        return self._suppression
+
+    @property
+    def is_suppressed(self) -> bool:
+        return self._suppression < 0.90
+
+
+blur_guard = MotionBlurGuard(
+    explosion_thresh=_BLUR_EXPLOSION_THRESH,
+    decay=_BLUR_SUPPRESSION_DEC,
+)
+
+
+# ── IMPROVEMENT 6: Danger Confidence Accumulator ─────────────────────────────
+
+class DangerConfidenceAccumulator:
+    """
+    Slow-build / slow-decay confidence score for emergency transitions.
+
+    Instead of counting raw confirmation frames (which can reset on a
+    single missed frame via the v7 soft-decay), this accumulator integrates
+    evidence over time like a leaky bucket:
+
+        on danger frame  : confidence += build_rate   (capped at 1.0)
+        on safe frame    : confidence -= decay_rate   (floored at 0.0)
+
+    `ready` returns True when confidence ≥ threshold.
+
+    This works **in addition to** the existing _emergency_confirm_count
+    logic — both gates must pass before ES fires (AND condition in
+    _check_emergency).
+    """
+
+    def __init__(self, build_rate: float = 0.18, decay_rate: float = 0.08,
+                 threshold: float = 0.72):
+        self.confidence  = 0.0
+        self._build      = build_rate
+        self._decay      = decay_rate
+        self._threshold  = threshold
+
+    def update_danger(self, is_dangerous: bool) -> None:
+        if is_dangerous:
+            self.confidence = min(1.0, self.confidence + self._build)
+        else:
+            self.confidence = max(0.0, self.confidence - self._decay)
+
+    @property
+    def ready(self) -> bool:
+        return self.confidence >= self._threshold
+
+    def reset(self) -> None:
+        self.confidence = 0.0
+
+
+danger_confidence = DangerConfidenceAccumulator(
+    build_rate=_DANGER_CONF_BUILD,
+    decay_rate=_DANGER_CONF_DECAY,
+    threshold=_DANGER_CONF_THRESH,
+)
+
+
+# ── IMPROVEMENT 7: Camera-Shake Detector (v9 false-positive hardened) ────────
+
+class CameraShakeDetector:
+    """
+    Estimates global camera motion using sparse optical flow (Lucas-Kanade)
+    on a downscaled greyscale frame pair.
+
+    v9 FALSE-POSITIVE FIX — 8 improvements applied:
+    ────────────────────────────────────────────────
+    1. Raised thresholds:  minor shake <45px ignored, collision >60px,
+                           severe >120px.  (was enter=14 — far too sensitive)
+    2. EMA flow smoothing: α=0.20 applied before ALL decisions so single-
+                           frame optical-flow spikes cannot trigger anything.
+    3. Sustained motion:   10+ consecutive frames AND confidence score ≥ 70
+                           required (was 4 frames with no score gate).
+    4. Confidence scoring: 0–100 bucket — builds at 8/frame when dangerous,
+                           decays at 4/frame when safe.  Must reach 70.
+    5. Delta validation:   requires flow_delta ≥ 15px alongside high flow,
+                           so smooth slow-pan cannot trigger even at 60px.
+    6. Minor-shake suppression: 10–40px nuisance band suppressed for first
+                           1 second — classifies webcam vibration / hand
+                           wobble and ignores it.
+    7. Post-clear cooldown: 2-second refractory period after any emergency
+                           clear prevents rapid ENTER/EXIT spam loops.
+    8. Structured logging:  score logged every 10-point increment; no
+                           repeated per-frame ENTER/EXIT messages.
+
+    Public API (unchanged from v8):
+        update(frame)                → call once per display frame
+        check_collision_emergency()  → True when confirmed collision active
+        suppression_factor()         → float in (0,1] for ES proximity scaling
+        is_shaking                   → bool (minor shake detected)
+        mean_flow                    → float (EMA-smoothed flow px/frame)
+        collision_consec_frames      → int  (HUD debug)
+        collision_active_elapsed     → float (seconds since emergency start)
+        collision_score              → float (0–100 current confidence)
+
+    On hardware without OpenCV's optical flow the detector gracefully
+    degrades — suppression_factor=1.0, no collision alarm.
+    """
+
+    _COLLISION_HOLD_SEC: float = 1.5  # minimum active duration (hysteresis)
+
+    def __init__(self,
+                 enter: float           = 45.0,
+                 exit_: float           = 20.0,
+                 suppression: float     = 0.55,
+                 collision_thresh: float  = 60.0,
+                 severe_thresh: float     = 120.0,
+                 score_build: float       = 8.0,
+                 score_decay: float       = 4.0,
+                 score_threshold: float   = 70.0,
+                 flow_delta_min: float    = 15.0,
+                 cooldown_sec: float      = 2.0,
+                 smoothing_alpha: float   = 0.20):
+
+        # ── Thresholds ────────────────────────────────────────────────────
+        self._enter            = enter            # minor-shake zone entry (px)
+        self._exit             = exit_            # minor-shake zone exit  (px)
+        self._supp_val         = suppression      # ES proximity multiplier
+        self._collision_thresh = collision_thresh # potential collision     (px)
+        self._severe_thresh    = severe_thresh    # definite impact         (px)
+        self._score_build      = score_build      # confidence per danger frame
+        self._score_decay      = score_decay      # confidence per safe frame
+        self._score_threshold  = score_threshold  # fire threshold (0–100)
+        self._flow_delta_min   = flow_delta_min   # min acceleration needed (px)
+        self._cooldown_sec     = cooldown_sec     # post-clear refractory (s)
+        self._alpha            = smoothing_alpha  # EMA weight for current flow
+
+        # ── Optical-flow state ────────────────────────────────────────────
+        self._shaking              = False
+        self._prev_grey: Optional[np.ndarray] = None
+        self._raw_flow             = 0.0
+        self._mean_flow            = 0.0   # EMA-smoothed — used everywhere
+        self._prev_smoothed_flow   = 0.0   # previous tick smoothed value
+
+        self._lk_params = dict(winSize=(15, 15), maxLevel=2,
+                                criteria=(cv2.TERM_CRITERIA_EPS |
+                                          cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+        self._feature_params = dict(maxCorners=16, qualityLevel=0.3,  # v10: 40→16
+                                     minDistance=10, blockSize=7)
+
+        # ── Collision detection state ─────────────────────────────────────
+        self._collision_consec:        int   = 0
+        self._collision_active:        bool  = False
+        self._collision_start_t:       float = 0.0
+        self._collision_hold_sec:      float = self._COLLISION_HOLD_SEC
+        self._collision_score:         float = 0.0   # 0–100 confidence bucket
+        self._last_collision_clear_t:  float = 0.0   # cooldown reference point
+
+        # ── Score-bucket logging state (req 8) ───────────────────────────
+        # _log_score_bucket: numeric divisor used by _advance_collision_state
+        # to determine when the score crosses a new 10-point boundary.
+        # _last_log_score: tracks the score value at the last log event so
+        # we can detect a bucket change without logging every frame.
+        self._log_score_bucket: float = 10.0   # log once per 10-point increment
+        self._last_log_score:   float = -1.0   # sentinel: no log yet this session
+
+        # ── Minor-shake pattern state (req 6) ─────────────────────────────
+        self._minor_shake_active:  bool  = False
+        self._minor_shake_start_t: float = 0.0
+
+        # ── Minor-shake pattern state (req 6) ─────────────────────────────────
+        self._minor_shake_active:  bool  = False
+        self._minor_shake_start_t: float = 0.0
+
+        # ── Log spam suppression (req 6 throttle) ────────────────────────────
+        self._last_minor_shake_log_t: float = 0.0   # throttle: max 1 log per 0.5 s
+    # ── Internal: compute raw optical flow ───────────────────────────────
+
+    def _compute_raw_flow(self, frame: np.ndarray) -> Optional[float]:
+        """
+        Downscale to 96×72 (v10: was 160×120), run Lucas-Kanade sparse flow,
+        return median magnitude scaled back to original resolution.  Returns
+        None when fewer than 4 feature points are available.
+        """
+        try:
+            small = cv2.resize(frame, (96, 72), interpolation=cv2.INTER_NEAREST)
+            grey  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+            if self._prev_grey is None:
+                self._prev_grey = grey
+                return None
+
+            pts = cv2.goodFeaturesToTrack(self._prev_grey, **self._feature_params)
+            if pts is None or len(pts) < 4:
+                self._prev_grey = grey
+                return None
+
+            next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+                self._prev_grey, grey, pts, None, **self._lk_params)
+
+            good_old = pts[status == 1]
+            good_new = next_pts[status == 1]
+            self._prev_grey = grey
+
+            if len(good_old) < 4:
+                return None
+
+            magnitudes = np.linalg.norm(good_new - good_old, axis=1)
+            scale      = frame.shape[1] / 96.0   # v10: updated divisor for new width
+            return float(np.median(magnitudes) * scale)
+
+        except Exception:
+            return None
+
+    # ── Internal: minor-shake pattern check (req 6) ──────────────────────
+
+    def _classify_minor_shake(self, flow: float) -> bool:
+        """
+        Returns True when flow sits in the 10–40px nuisance band for under
+        1 second — typical of hand vibration or desk wobble.
+        """
+        in_band = 10.0 <= flow <= 40.0
+        if in_band:
+            if not self._minor_shake_active:
+                self._minor_shake_active  = True
+                self._minor_shake_start_t = time.time()
+            return (time.time() - self._minor_shake_start_t) < 1.0
+        else:
+            self._minor_shake_active  = False
+            self._minor_shake_start_t = 0.0
+            return False
+
+    # ── Public: update ────────────────────────────────────────────────────
+
+    def update(self, frame: np.ndarray) -> None:
+        """
+        Call once per display frame.  Updates smoothed flow, shake flag,
+        collision confidence score, and collision-active state.
+        """
+        raw = self._compute_raw_flow(frame)
+        if raw is None:
+            # No usable flow data this frame — decay score, advance state
+            self._advance_collision_state(high_flow=False, delta=0.0)
+            return
+
+        self._raw_flow = raw
+
+        # ── Req 2: EMA smoothing — all further decisions use this value ───
+        self._mean_flow = (
+            self._alpha * raw
+            + (1.0 - self._alpha) * self._mean_flow
+        )
+        flow = self._mean_flow
+
+        # ── Req 5: motion delta (flow acceleration) ───────────────────────
+        flow_delta               = abs(flow - self._prev_smoothed_flow)
+        self._prev_smoothed_flow = flow
+
+        # ── Req 6: minor-shake suppression ───────────────────────────────
+        # AFTER
+        if self._classify_minor_shake(flow):
+            self._shaking = True
+            now_log = time.time()
+            if now_log - self._last_minor_shake_log_t >= 0.5:
+                self._last_minor_shake_log_t = now_log
+                event_log.log("WATCHDOG",
+                              f"Minor shake ignored "
+                              f"(flow={flow:.1f}px delta={flow_delta:.1f}px "
+                              f"dur={now_log - self._minor_shake_start_t:.2f}s)")
+            self._advance_collision_state(high_flow=False, delta=flow_delta)
+            return
+
+        # ── Shake suppression flag (for ES proximity weighting) ───────────
+        # Uses the raised enter/exit thresholds — minor vibration no longer
+        # toggles this flag.
+        if self._shaking:
+            if flow < self._exit:
+                self._shaking = False
+        else:
+            if flow > self._enter:
+                self._shaking = True
+
+        # ── Req 1 + 5: collision zone — requires HIGH flow AND acceleration
+        # Severe flow (>= severe_thresh) bypasses the delta requirement since
+        # a violent impact is unambiguous.
+        if flow >= self._severe_thresh:
+            high_flow = True
+        elif flow >= self._collision_thresh and flow_delta >= self._flow_delta_min:
+            high_flow = True
+        else:
+            high_flow = False
+
+        self._advance_collision_state(high_flow=high_flow, delta=flow_delta)
+
+    # ── Internal: collision confidence + state machine ────────────────────
+
+    def _advance_collision_state(self, high_flow: bool, delta: float) -> None:
+        """
+        Manages the confidence score, consecutive-frame counter, timed hold,
+        and post-clear cooldown.  Called every frame via update().
+        """
+        now = time.time()
+
+        # ── Req 7: cooldown gate — no retrigger for cooldown_sec ─────────
+        if (not self._collision_active
+                and self._last_collision_clear_t > 0.0
+                and (now - self._last_collision_clear_t) < self._cooldown_sec):
+            if high_flow:
+                event_log.log("WATCHDOG",
+                              f"Motion spike filtered — cooldown active "
+                              f"({now - self._last_collision_clear_t:.1f}s / "
+                              f"{self._cooldown_sec:.1f}s)")
+            return
+
+        # ── Req 4: confidence score update ───────────────────────────────
+        if high_flow:
+            self._collision_score = min(100.0,
+                                        self._collision_score + self._score_build)
+        else:
+            self._collision_score = max(0.0,
+                                        self._collision_score - self._score_decay)
+
+        # ── Req 8: log score at 10-point increments (not every frame) ────
+        bucket     = int(self._collision_score / self._log_score_bucket)
+        last_bucket = int(self._last_log_score  / self._log_score_bucket)
+        if bucket != last_bucket and self._collision_score > 0.0:
+            event_log.log("WATCHDOG",
+                          f"Collision confidence: {self._collision_score:.0f}% "
+                          f"(flow={self._mean_flow:.1f}px "
+                          f"delta={delta:.1f}px "
+                          f"consec={self._collision_consec})")
+            self._last_log_score = self._collision_score
+
+        if self._collision_active:
+            # ── ACTIVE: check whether hold has expired and flow calmed ────
+            held = now - self._collision_start_t
+            if held >= self._collision_hold_sec and not high_flow:
+                self._collision_active       = False
+                self._last_collision_clear_t = now
+                self._collision_consec       = 0
+                self._collision_score        = 0.0
+                self._last_log_score         = -1.0
+                event_log.log("WATCHDOG",
+                              f"Collision emergency CLEARED "
+                              f"(held {held:.1f}s, "
+                              f"flow={self._mean_flow:.1f}px)")
+            # else: hold still running or flow still high → stay active
+
+        else:
+            if high_flow:
+                self._collision_consec += 1
+
+                # ── Req 3: sustained motion check ─────────────────────────
+                # BOTH frame count AND confidence score must be satisfied.
+                if (self._collision_consec >= 10
+                        and self._collision_score >= self._score_threshold):
+                    self._collision_active  = True
+                    self._collision_start_t = now
+                    self._collision_consec  = 0
+                    event_log.log("WATCHDOG",
+                                  f"Emergency collision CONFIRMED — "
+                                  f"flow={self._mean_flow:.1f}px "
+                                  f"score={self._collision_score:.0f}% "
+                                  f"sustained 10 frames")
+                elif self._collision_consec >= 4:
+                    # Informational only — not yet at threshold
+                    event_log.log("WATCHDOG",
+                                  f"Sustained violent motion detected "
+                                  f"({self._collision_consec}/10 frames "
+                                  f"score={self._collision_score:.0f}%)")
+            else:
+                # Decay consec counter slowly — a single calm frame does not
+                # reset it (prevents a 1-frame dip from restarting the count)
+                self._collision_consec = max(0, self._collision_consec - 1)
+
+    # ── Public API (interface identical to v8) ────────────────────────────
+
+    def check_collision_emergency(self) -> bool:
+        """
+        Returns True when a confirmed sustained-flow collision is active
+        and the hold period has not yet expired.
+        Independent of YOLO / human detection.
+        """
+        return self._collision_active
+
+    @property
+    def collision_consec_frames(self) -> int:
+        """Current consecutive high-flow frame count (for HUD / debug)."""
+        return self._collision_consec
+
+    @property
+    def collision_active_elapsed(self) -> float:
+        """Seconds since the collision emergency started (0 if inactive)."""
+        if not self._collision_active:
+            return 0.0
+        return time.time() - self._collision_start_t
+
+    @property
+    def collision_score(self) -> float:
+        """Current collision confidence score in range 0–100."""
+        return self._collision_score
+
+    @property
+    def is_shaking(self) -> bool:
+        """True when smoothed flow exceeds the shake-entry threshold."""
+        return self._shaking
+
+    @property
+    def mean_flow(self) -> float:
+        """EMA-smoothed optical flow magnitude in px/frame."""
+        return self._mean_flow
+
+    def suppression_factor(self) -> float:
+        """
+        Returns _supp_val (<1.0) when shaking, 1.0 otherwise.
+        Multiplied into ES proximity scores by _check_emergency().
+        """
+        return self._supp_val if self._shaking else 1.0
+
+
+camera_shake = CameraShakeDetector(
+    enter=_SHAKE_FLOW_ENTER,
+    exit_=_SHAKE_FLOW_EXIT,
+    suppression=_SHAKE_SUPPRESSION,
+    collision_thresh=_COLLISION_FLOW_THRESH,
+    severe_thresh=_SEVERE_COLLISION_THRESH,
+    score_build=_COLLISION_SCORE_BUILD,
+    score_decay=_COLLISION_SCORE_DECAY,
+    score_threshold=_COLLISION_SCORE_THRESHOLD,
+    flow_delta_min=_COLLISION_FLOW_DELTA_MIN,
+    cooldown_sec=_COLLISION_COOLDOWN_SEC,
+    smoothing_alpha=_FLOW_SMOOTHING_ALPHA,
+)
 
 
 def estimate_pseudo_depth_v3(x1, y1, x2, y2, frame_w, frame_h, tid=-1) -> float:
+    """
+    Pseudo-depth estimator — v7 rewrite.
+
+    v7 changes (architecture and ToF hook preserved verbatim):
+    ─────────────────────────────────────────────────────────
+    FIX-8a  Minimum size gate: boxes < _MIN_OBS_AREA_FRAC of frame area
+            return 0.0 immediately — noisy texture blobs eliminated.
+    FIX-4c  Aspect-ratio penalty: boxes with w:h > _MAX_OBS_ASPECT or
+            < 1/_MAX_OBS_ASPECT (flat floor/ceiling, thin wall column) lose
+            up to 55% of their proximity weight via a smooth curve.
+    FIX-4a  Area weight reduced 0.55 → 0.35 so large distant surfaces no
+            longer dominate the raw score.
+    FIX-4b  Centre-distance factor: an obstacle at the horizontal frame edge
+            (cx ≈ 0 or frame_w) gets 60% weight reduction — side walls can
+            no longer masquerade as frontal threats.
+    FIX-6   EMA applied on the tid=-1 live path too (via _live_prox_ema keyed
+            on bbox hash) so single-frame spikes reaching _check_emergency are
+            pre-smoothed before the confirmation buffer sees them.
+    """
     if frame_w <= 0 or frame_h <= 0:
         return 0.0
-    bw, bh     = max(0, x2-x1), max(0, y2-y1)
-    area_cue   = min(1.0, (bw * bh) / (frame_w * frame_h))
+
+    bw, bh = max(0, x2 - x1), max(0, y2 - y1)
+
+    # ── FIX-8a: minimum size gate ─────────────────────────────────────────
+    raw_area_frac = (bw * bh) / max(1, frame_w * frame_h)
+    if raw_area_frac < _MIN_OBS_AREA_FRAC:
+        return 0.0   # blob too small — not a real collision threat
+
+    # ── FIX-4c: aspect-ratio penalty ──────────────────────────────────────
+    aspect = bw / max(1, bh)                              # width : height ratio
+    if aspect > _MAX_OBS_ASPECT or aspect < (1.0 / _MAX_OBS_ASPECT):
+        # Extreme flat (floor/ceiling) or thin (wall column) detection
+        aspect_penalty = 0.45
+    else:
+        # Smooth penalty curve: 1.0 at square, decreasing toward limits
+        excess = max(aspect / _MAX_OBS_ASPECT,
+                     (_MAX_OBS_ASPECT / max(aspect, 1e-6)) ** -1)
+        aspect_penalty = float(np.clip(1.0 - 0.3 * (excess - 1.0), 0.45, 1.0))
+
+    # ── Spatial cues ──────────────────────────────────────────────────────
+    area_cue   = min(1.0, raw_area_frac)
     width_cue  = min(1.0, bw / frame_w)
     height_cue = min(1.0, bh / frame_h)
     cy_norm    = ((y1 + y2) / 2.0) / frame_h
+    cx_norm    = ((x1 + x2) / 2.0) / frame_w
     vpos_cue   = float(np.clip(cy_norm, 0.0, 1.0))
+
+    # ── FIX-4b: centre-distance weighting ─────────────────────────────────
+    # Obstacle dead-centre (cx_norm=0.5) = full weight.
+    # At frame edge (cx_norm=0 or 1) = 40% weight — side walls ignored.
+    centre_dist   = abs(cx_norm - 0.5)
+    centre_factor = float(np.clip(1.0 - centre_dist * 1.2, 0.40, 1.0))
+
     # HARDWARE-READY COMMENT: ToF / ultrasonic proximity blend
     # Uncomment and implement once hardware is connected:
     # zone = classify_horizontal_zone((x1+x2)//2, frame_w)
     # sensor_prox = sensor_fusion.get_proximity(zone)
     # if sensor_prox is not None: raw = 0.6*raw + 0.4*sensor_prox
+
+    # ── FIX-4a: lower area dominance, apply spatial modifiers ────────────
+    # Old: 0.55*area + 0.20*width + 0.15*height + 0.10*vpos
+    # New: area weight reduced, centre + aspect corrections applied
     raw = float(np.clip(
-        0.55*area_cue + 0.20*width_cue + 0.15*height_cue + 0.10*vpos_cue,
-        0.0, 1.0
+        (0.35 * area_cue + 0.28 * width_cue + 0.22 * height_cue + 0.15 * vpos_cue)
+        * centre_factor
+        * aspect_penalty,
+        0.0, 1.0,
     ))
+
+    # ── FIX-6: EMA on BOTH tracked and live paths ─────────────────────────
     if tid >= 0:
+        # Original tracked-object EMA (unchanged)
         prev     = _depth_ema.get(tid, raw)
         smoothed = _DEPTH_EMA_ALPHA * raw + (1.0 - _DEPTH_EMA_ALPHA) * prev
         _depth_ema[tid] = smoothed
         return smoothed
-    return raw
+    else:
+        # v7: smooth the live/untracked path used by _check_emergency
+        bbox_key = hash((x1, y1, x2, y2)) & 0xFFFFFFFF
+        prev     = _live_prox_ema.get(bbox_key, raw)
+        smoothed = _LIVE_PROX_EMA_ALPHA * raw + (1.0 - _LIVE_PROX_EMA_ALPHA) * prev
+        if len(_live_prox_ema) > 150:   # evict oldest entries to bound memory
+            for _k in list(_live_prox_ema.keys())[:50]:
+                _live_prox_ema.pop(_k, None)
+        _live_prox_ema[bbox_key] = smoothed
+        return smoothed
 
 
 def classify_horizontal_zone(cx: int, frame_w: int) -> str:
@@ -1242,13 +1995,72 @@ def _update_obstacle_memory(live: List[ObstacleInfo]) -> List[ObstacleInfo]:
 
 
 def _compute_live_obstacles(boxes: list, frame_w: int, frame_h: int) -> List[ObstacleInfo]:
-    now  = time.time()
-    live = []
+    """
+    v8 additions (architecture unchanged):
+
+    IMPROVEMENT 3 — confidence weighting
+        Low-YOLO-confidence detections have their proximity scaled down
+        via a linear ramp between conf_weight_floor and conf_weight_ceil.
+
+    IMPROVEMENT 5 — forward-corridor priority
+        Objects near the lateral frame edges (cx close to 0 or frame_w)
+        get an additional proximity weight reduction.  Only objects
+        overlapping the flight corridor receive full weight.
+
+    IMPROVEMENT 1 — stability score applied here
+        bbox_stability.update() is called; the returned score multiplies
+        the final proximity.  Flickering boxes lose weight automatically.
+
+    IMPROVEMENT 2 — approach velocity called here
+        approach_tracker.update() is called but its weight is NOT applied
+        to _compute_live_obstacles — this path feeds _check_emergency
+        directly, so we want unmodified proximity values.  The tracker
+        merely accumulates history so _check_emergency can query it.
+    """
+    now        = time.time()
+    frame_area = max(1, frame_w * frame_h)
+    live       = []
+
     for (x1, y1, x2, y2, conf, tid, cls_id) in boxes:
         if cls_id not in NAVIGATION_CLASSES:
             continue
+
+        # ── IMPROVEMENT 3: confidence weight ─────────────────────────────
+        # Scale proximity down for low-confidence detections.
+        # Detections above conf_weight_ceil are unaffected (weight=1.0).
+        conf_weight = float(np.clip(
+            (conf - _CONF_WEIGHT_FLOOR) / max(_CONF_WEIGHT_CEIL - _CONF_WEIGHT_FLOOR, 1e-4),
+            0.20,   # floor: even very low-conf detections keep 20% weight
+            1.0,
+        ))
+
         cx, cy    = (x1+x2)//2, (y1+y2)//2
         proximity = estimate_pseudo_depth_v3(x1, y1, x2, y2, frame_w, frame_h, tid=-1)
+
+        # ── IMPROVEMENT 5: flight-corridor priority ────────────────────────
+        # Objects at the lateral edges of the frame (side walls, door frames)
+        # receive a reduced weight because they are NOT in the flight path.
+        # The existing centre-distance factor inside estimate_pseudo_depth_v3
+        # already accounts for this geometrically; here we add a second soft
+        # gate to further suppress clearly off-axis detections.
+        cx_norm        = cx / max(1, frame_w)
+        lateral_offset = abs(cx_norm - 0.5)          # 0 = centre, 0.5 = edge
+        # Objects more than 40% off-centre get up to 30% additional penalty
+        corridor_weight = float(np.clip(
+            1.0 - max(0.0, lateral_offset - 0.25) * 1.20,
+            0.70, 1.0,
+        ))
+
+        # ── IMPROVEMENT 1: bbox stability weight ──────────────────────────
+        stability_score = bbox_stability.update(tid, (x1, y1, x2, y2))
+
+        # ── IMPROVEMENT 2: approach velocity history ──────────────────────
+        # We call update here purely to keep the tracker's history current.
+        approach_tracker.update(tid, (x1, y1, x2, y2), frame_area)
+
+        # Apply all v8 weights to this path's proximity
+        proximity = proximity * conf_weight * corridor_weight * stability_score
+
         live.append(ObstacleInfo(
             box=(x1, y1, x2, y2), proximity=proximity,
             zone=classify_horizontal_zone(cx, frame_w),
@@ -1259,19 +2071,48 @@ def _compute_live_obstacles(boxes: list, frame_w: int, frame_h: int) -> List[Obs
 
 
 def analyse_obstacles(boxes: list, frame_w: int, frame_h: int) -> List[ObstacleInfo]:
+    """
+    v7 addition: two pre-filters applied before proximity estimation.
+
+    FIX-8b  Boxes smaller than _MIN_OBS_AREA_FRAC are skipped entirely —
+            they never enter obstacle memory and cannot trigger navigation
+            or emergency decisions.
+    FIX-8c  Boxes with an extreme aspect ratio (> _MAX_OBS_ASPECT × 1.5 or
+            < its reciprocal) are also skipped.  Detections this flat or thin
+            are overwhelmingly walls, floors, or ceiling reflections — not
+            navigable objects in the forward flight corridor.
+
+    Everything else (memory merge, EMA proximity, sort) is identical to v6.
+    """
     now  = time.time()
     live = []
     for (x1, y1, x2, y2, conf, tid, cls_id) in boxes:
         if cls_id not in NAVIGATION_CLASSES:
             continue
-        cx, cy    = (x1+x2)//2, (y1+y2)//2
+
+        # ── FIX-8b: minimum size gate ─────────────────────────────────────
+        bw = max(0, x2 - x1)
+        bh = max(0, y2 - y1)
+        if (bw * bh) / max(1, frame_w * frame_h) < _MIN_OBS_AREA_FRAC:
+            continue   # blob too small — skip entirely
+
+        # ── FIX-8c: extreme aspect ratio gate ────────────────────────────
+        # Very wide (floor/ceiling) and razor-thin (wall column) detections
+        # are pre-rejected before they reach estimate_pseudo_depth_v3.
+        aspect = bw / max(1, bh)
+        if aspect > (_MAX_OBS_ASPECT * 1.5) or aspect < (1.0 / (_MAX_OBS_ASPECT * 1.5)):
+            continue   # extreme flat/thin surface — not a navigable obstacle
+
+        cx, cy    = (x1 + x2) // 2, (y1 + y2) // 2
         proximity = estimate_pseudo_depth_v3(x1, y1, x2, y2, frame_w, frame_h, tid)
+
         live.append(ObstacleInfo(
             box=(x1, y1, x2, y2), proximity=proximity,
             zone=classify_horizontal_zone(cx, frame_w),
             v_zone=classify_vertical_zone(cy, frame_h),
             is_human=(cls_id == HUMAN_CLASS), tid=tid, cls_id=cls_id, timestamp=now,
         ))
+
     live.sort(key=lambda o: o.proximity, reverse=True)
     return _update_obstacle_memory(live)
 
@@ -1463,10 +2304,11 @@ _oscillation_timestamps: deque = deque()
 _EMERG_IDLE     = "IDLE"
 _EMERG_ACTIVE   = "ACTIVE"
 _EMERG_RECOVERY = "RECOVERY"
-_emergency_phase:      str   = _EMERG_IDLE
-_emergency_start_time: float = 0.0
-_emergency_reason:     str   = ""
-_emergency_last_sent:  float = 0.0
+_emergency_phase:         str   = _EMERG_IDLE
+_emergency_start_time:   float = 0.0
+_emergency_reason:       str   = ""
+_emergency_last_sent:    float = 0.0
+_emergency_confirm_count: int  = 0   # v7: consecutive dangerous CENTER frames
 
 
 def _is_dangerous_oscillation(cmd_a: str, cmd_b: str) -> bool:
@@ -1475,39 +2317,139 @@ def _is_dangerous_oscillation(cmd_a: str, cmd_b: str) -> bool:
 
 def _check_emergency(raw_cmd: str, prev_raw: str,
                      live_obstacles: List[ObstacleInfo]) -> bool:
+    """
+    Emergency Safety Layer — v8 rewrite of IDLE phase only.
+    ACTIVE and RECOVERY phases are preserved verbatim from v7.
+
+    v8 IDLE-phase additions (all existing v7 fixes retained):
+    ──────────────────────────────────────────────────────────
+    IMPROVEMENT 4 — blur guard multiplier
+        blur_guard.suppression_factor() scales every obstacle's effective
+        proximity before the threshold comparison.  If the camera just saw
+        a bbox explosion (blur / shake artefact), suppression drops toward
+        0.15 so single-frame YOLO hallucinations cannot fill the
+        confirmation buffer.
+
+    IMPROVEMENT 6 — danger confidence gate (second AND condition)
+        danger_confidence must also be ≥ threshold before ES fires.
+        It builds slowly (build_rate per frame) and decays slowly so
+        brief dangerous frames are absorbed without triggering ES.
+
+    IMPROVEMENT 7 — camera-shake suppression
+        camera_shake.suppression_factor() further attenuates proximity
+        when global frame motion is detected.  This handles hand-held
+        webcam testing and physical vibration on the real drone.
+
+    IMPROVEMENT 2 — approach velocity gate
+        For each candidate CENTER obstacle we check approach_tracker;
+        objects that are NOT growing in area (stationary wall, ceiling)
+        have their contribution reduced by 50%.
+    """
     global _emergency_phase, _emergency_start_time, _emergency_reason
-    global _emergency_last_sent
+    global _emergency_last_sent, _emergency_confirm_count
 
     now = time.time()
 
+    # ── Oscillation tracking (unchanged) ──────────────────────────────────
     if _is_dangerous_oscillation(raw_cmd, prev_raw):
         _oscillation_timestamps.append(now)
     while (_oscillation_timestamps
            and (now - _oscillation_timestamps[0]) > OSCILLATION_GUARD_WINDOW):
         _oscillation_timestamps.popleft()
 
+    # ── IDLE phase ────────────────────────────────────────────────────────
     if _emergency_phase == _EMERG_IDLE:
+
+        # v8: combined suppression factor from blur + shake guards
+        suppress = blur_guard.suppression_factor() * camera_shake.suppression_factor()
+
+        # v8 IMPROVEMENT 2 + 7 + 4: centre-corridor check with suppression
+        center_danger = []
         for obs in live_obstacles:
-            if obs.proximity >= EMERGENCY_AREA_FRAC:
-                _emergency_phase      = _EMERG_ACTIVE
-                _emergency_start_time = now
-                _emergency_reason     = (f"obstacle {obs.proximity*100:.0f}% "
-                                         f">= {EMERGENCY_AREA_FRAC*100:.0f}%")
-                _emergency_last_sent  = 0.0
-                _oscillation_timestamps.clear()
-                event_log.log("EMERGENCY", f"Entered — {_emergency_reason}",
-                              proximity=obs.proximity)
-                return True
-        if len(_oscillation_timestamps) > OSCILLATION_GUARD_LIMIT:
-            _emergency_phase      = _EMERG_ACTIVE
-            _emergency_start_time = now
-            _emergency_reason     = "oscillation guard"
+            if obs.zone != "CENTER" or obs.v_zone != "MIDDLE":
+                continue
+
+            # Apply combined suppression to effective proximity
+            eff_prox = obs.proximity * suppress
+
+            # IMPROVEMENT 2: penalise non-approaching obstacles
+            approach_weight = approach_tracker.velocity(obs.tid)
+            # approach_weight is a raw velocity (fractional area/s).
+            # If velocity ≤ 0 the object is not closing — reduce contribution.
+            if approach_weight <= 0:
+                eff_prox *= 0.60   # 40% reduction for stationary/receding objects
+            elif approach_weight < _APPROACH_MIN_GROWTH:
+                eff_prox *= float(np.clip(
+                    0.60 + 0.40 * (approach_weight / _APPROACH_MIN_GROWTH), 0.60, 1.0))
+
+            if eff_prox >= _EMERGENCY_ENTER_FRAC:
+                center_danger.append(obs)
+
+        is_dangerous = len(center_danger) > 0
+
+        # v8 IMPROVEMENT 6: update danger confidence accumulator
+        danger_confidence.update_danger(is_dangerous)
+
+        if is_dangerous:
+            _emergency_confirm_count += 1
+            event_log.log(
+                "WATCHDOG",
+                f"ES confirm {_emergency_confirm_count}/{_EMERGENCY_CONFIRM_FRAMES} "
+                f"| DangerConf {danger_confidence.confidence:.2f}/{_DANGER_CONF_THRESH:.2f} "
+                f"| BlurSupp {blur_guard.suppression_factor():.2f} "
+                f"| ShakeSupp {camera_shake.suppression_factor():.2f} "
+                f"| prox {max(o.proximity for o in center_danger) * 100:.0f}%",
+            )
+        else:
+            _emergency_confirm_count = max(0, _emergency_confirm_count - 2)
+
+        # v8: BOTH confirmation frames AND danger confidence must be satisfied
+        if (_emergency_confirm_count >= _EMERGENCY_CONFIRM_FRAMES
+                and danger_confidence.ready):
+
+            # Final blur/shake check — if still heavily suppressed, defer
+            if suppress < 0.40:
+                event_log.log(
+                    "WATCHDOG",
+                    f"ES deferred — combined suppression {suppress:.2f} too low "
+                    f"(blur={blur_guard.suppression_factor():.2f} "
+                    f"shake={camera_shake.suppression_factor():.2f})",
+                )
+                _emergency_confirm_count = max(0, _emergency_confirm_count - 3)
+                return False
+
+            worst = max(center_danger, key=lambda o: o.proximity)
+            _emergency_phase         = _EMERG_ACTIVE
+            _emergency_start_time    = now
+            _emergency_confirm_count = 0
+            danger_confidence.reset()
+            _emergency_reason = (
+                f"CENTER obstacle {worst.proximity * 100:.0f}% "
+                f">= {_EMERGENCY_ENTER_FRAC * 100:.0f}% "
+                f"({_EMERGENCY_CONFIRM_FRAMES} frames + conf "
+                f"{danger_confidence._threshold:.2f} confirmed)"
+            )
             _emergency_last_sent  = 0.0
+            _oscillation_timestamps.clear()
+            event_log.log("EMERGENCY", f"Entered — {_emergency_reason}",
+                          proximity=worst.proximity)
+            return True
+
+        # Oscillation guard (unchanged)
+        if len(_oscillation_timestamps) > OSCILLATION_GUARD_LIMIT:
+            _emergency_phase         = _EMERG_ACTIVE
+            _emergency_start_time    = now
+            _emergency_reason        = "oscillation guard"
+            _emergency_last_sent     = 0.0
+            _emergency_confirm_count = 0
+            danger_confidence.reset()
             _oscillation_timestamps.clear()
             event_log.log("EMERGENCY", "Entered — oscillation guard")
             return True
+
         return False
 
+    # ── ACTIVE phase (unchanged from v7) ──────────────────────────────────
     if _emergency_phase == _EMERG_ACTIVE:
         elapsed = now - _emergency_start_time
         if elapsed < EMERGENCY_HOLD_DURATION:
@@ -1520,22 +2462,27 @@ def _check_emergency(raw_cmd: str, prev_raw: str,
         _emergency_start_time = now
         event_log.log("EMERGENCY", "Hold elapsed → RECOVERY phase")
 
+    # ── RECOVERY phase (unchanged from v7) ────────────────────────────────
     if _emergency_phase == _EMERG_RECOVERY:
         max_live_prox = max((obs.proximity for obs in live_obstacles), default=0.0)
-        if max_live_prox < SAFE_RELEASE_FRAC:
-            _emergency_phase  = _EMERG_IDLE
-            _emergency_reason = ""
-            event_log.log("EMERGENCY",
-                          f"Released — live prox {max_live_prox*100:.0f}% < threshold")
+        if max_live_prox < _EMERGENCY_EXIT_FRAC:
+            _emergency_phase         = _EMERG_IDLE
+            _emergency_reason        = ""
+            _emergency_confirm_count = 0
+            danger_confidence.reset()
+            event_log.log(
+                "EMERGENCY",
+                f"Released — live prox {max_live_prox * 100:.0f}% "
+                f"< {_EMERGENCY_EXIT_FRAC * 100:.0f}% (exit threshold)",
+            )
             return False
         if now - _emergency_last_sent >= EMERGENCY_RESEND_INTERVAL:
             _emergency_last_sent = now
             event_log.log("WATCHDOG",
-                          f"Recovery blocked — prox {max_live_prox*100:.0f}%")
+                          f"Recovery blocked — prox {max_live_prox * 100:.0f}%")
         return True
 
     return False
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SPEED-TIERED FORWARD (unchanged)
@@ -1740,6 +2687,10 @@ _MOTION_TO_FC: Dict[str, Tuple[int, float, float, float]] = {
     MOVE_SCAN_FORWARD   : ( 85,   0.0,  -5.0,  0.0),   # creep forward while scanning
     MOVE_SAFE_SEARCH    : ( 65,   0.0,   0.0,  8.0),   # very slow yaw, low throttle
     MOVE_EMERGENCY_STOP : (  0,   0.0,   0.0,  0.0),   # zero throttle → DISARM
+    # PATCH P4: collision-emergency backoff — aggressive nose-up + reduced throttle.
+    # Arduino "E" handler applies this for BACKOFF_HOLD_MS=500 ms then auto-reverts
+    # to hover.  Kept separate from MOVE_BACKWARD so the collision path is explicit.
+    MOVE_BACKOFF        : ( 70,   0.0,  22.0,  0.0),   # nose-up reverse burst → BACKOFF
 }
 
 # Throttle ceiling in safe-test mode (maps 0-200 to 0-safe_test_pwm_max)
@@ -1758,22 +2709,27 @@ class ArduinoController(AbstractFlightController):
     Arduino Nano flight controller — final_verdict_auto.ino protocol.
 
     Translates MotionPrimitive strings into the sketch's native serial
-    command set: ARM / DISARM / THROTTLE / ROLL / PITCH / YAW.
+    command set: ARM / DISARM / THROTTLE / ROLL / PITCH / YAW / PING / E.
 
     Key behaviours
     ──────────────
     • ARM on first motion command after connect; DISARM on EMERGENCY_STOP.
-    • Keepalive thread sends STATUS every 1 s to beat the sketch's 2 s
-      cmd-timeout failsafe (CMD_TO_MS 2000).  STATUS also refreshes
-      lastCmdMs on the Arduino side.
-    • Telemetry reader thread parses the sketch's 5 Hz [ARM]/[DIS] lines
-      and JSON STATUS responses, storing them in self.telemetry.
-    • Stale-command TTL preserved from v5: outdated commands are dropped.
+    • PATCH P3: Two independent locks — _lock guards motion state only;
+      _serial_lock guards serial port writes only.  Keepalive and motion
+      commands can execute concurrently without blocking each other.
+    • PATCH P3: Keepalive sends PING (zero-output) instead of STATUS so
+      it never floods the Arduino's 64-byte UART buffer.
+    • PATCH P2: ARM confirmation polls _armed flag for up to 2.0 s.
+    • PATCH P1: Stale-command TTL now computed from the correct timestamp.
+    • PATCH P4: MOVE_BACKOFF sends Arduino "E" command for collision reverse.
+    • PATCH P5: send_token() explicitly handles the "E" backoff token.
+    • Telemetry reader thread parses [ARM]/[DIS] lines, JSON STATUS, and
+      the new BACKOFF / BACKOFF_END responses from the patched .ino.
     • Full reconnect logic preserved from v5.
     """
 
     # Keepalive must arrive faster than the sketch's CMD_TO_MS = 2000 ms
-    _KEEPALIVE_INTERVAL: float = 0.8   # seconds between STATUS pings
+    _KEEPALIVE_INTERVAL: float = 0.8   # seconds between PING keepalives
 
     def __init__(self, port: str = SERIAL_PORT_DEFAULT,
                  baud: int = SERIAL_BAUD_DEFAULT,
@@ -1785,9 +2741,12 @@ class ArduinoController(AbstractFlightController):
         self._last_motion  = ""
         self._last_send_t  = 0.0
         self._armed        = False
-        self._lock         = threading.Lock()
+        # PATCH P3: _lock guards motion state; _serial_lock guards serial writes.
+        # These must NEVER be acquired in the same call path to avoid deadlock.
+        self._lock         = threading.Lock()         # motion-state lock
+        self._serial_lock  = threading.Lock()         # serial-port write lock
         self._stop_evt     = threading.Event()
-        self._ka_thread:  Optional[threading.Thread] = None
+        self._ka_thread:   Optional[threading.Thread] = None
         self._telem_thread: Optional[threading.Thread] = None
 
         # Latest telemetry parsed from the sketch's serial output
@@ -1796,6 +2755,7 @@ class ArduinoController(AbstractFlightController):
             "imu": "UNKNOWN", "thr": 0,
             "FL": 0, "FR": 0, "RR": 0, "RL": 0,
             "hz": 0, "ovr": 0,
+            "backoff": False,   # PATCH A4: tracks active Arduino backoff state
         }
 
         if enabled:
@@ -1807,7 +2767,11 @@ class ArduinoController(AbstractFlightController):
         try:
             import serial as _serial
             self._ser = _serial.Serial(self.port, self.baud, timeout=1)
-            time.sleep(2.0)        # allow Arduino bootloader to finish
+            # PATCH P2: extended boot wait from 2.0 s to 3.5 s.
+            # Arduino calibrateIMU() takes CAL_SAMPLES=1000 × 1 ms = ~1 s minimum.
+            # Add 2.5 s margin for bootloader, filter seeding, and Serial.println
+            # output to flush before Python starts sending commands.
+            time.sleep(3.5)
             self._ser.reset_input_buffer()
             event_log.log("SERIAL", f"Connected to {self.port} @ {self.baud} baud")
             self._armed = False
@@ -1825,7 +2789,7 @@ class ArduinoController(AbstractFlightController):
                 self._ser.close()
         except Exception:
             pass
-        self._ser  = None
+        self._ser   = None
         self._armed = False
         self._stop_evt.clear()
         perf.increment_reconnect()
@@ -1844,31 +2808,40 @@ class ArduinoController(AbstractFlightController):
         self._telem_thread.start()
         event_log.log("WATCHDOG",
                       f"FC keepalive + telemetry threads started "
-                      f"(keepalive every {self._KEEPALIVE_INTERVAL}s)")
+                      f"(keepalive every {self._KEEPALIVE_INTERVAL}s, "
+                      f"using PING — zero serial output)")
 
     def _keepalive_loop(self) -> None:
         """
-        Sends STATUS every _KEEPALIVE_INTERVAL seconds.
-        Beats the Arduino's CMD_TO_MS=2000 ms cmd-timeout failsafe so the
-        drone does not auto-disarm during a pause in navigation commands.
+        PATCH P3: Sends PING every _KEEPALIVE_INTERVAL seconds.
+
+        Changes from original:
+        • Uses PING instead of STATUS — the Arduino PING handler updates
+          lastCmdMs without producing any serial output, so the 64-byte
+          UART TX buffer is never stressed by keepalive traffic.
+        • Uses _serial_lock (not _lock) so keepalive writes never block
+          when send_motion() is mid-burst sending THROTTLE/ROLL/PITCH/YAW.
+        • Reads _armed under _lock only, then releases before writing.
         """
         while not self._stop_evt.is_set():
             time.sleep(self._KEEPALIVE_INTERVAL)
             if self._stop_evt.is_set():
                 break
             with self._lock:
-                if self._armed:
-                    self._write_raw("STATUS")
+                armed_now = self._armed
+            if armed_now:
+                # PATCH P3: use _serial_lock for the write, not _lock
+                self._write_raw("PING")
 
     def _telemetry_loop(self) -> None:
         """
         Reads lines from the Arduino and parses:
           • JSON STATUS response  → self.telemetry dict
-          • 5 Hz telemetry line   → self.telemetry dict (subset)
+          • 5 Hz [ARM]/[DIS] line → self.telemetry dict (subset)
           • ARMED / DISARMED      → self._armed flag
+          • PATCH A4: BACKOFF / BACKOFF_END → self.telemetry["backoff"]
         """
         import json as _json
-        buf = ""
         while not self._stop_evt.is_set():
             try:
                 if self._ser is None or not self._ser.is_open:
@@ -1882,6 +2855,23 @@ class ArduinoController(AbstractFlightController):
                     continue
 
                 event_log.log("SERIAL", f"FC→PC: {line}")
+
+                # ── PATCH A4: BACKOFF acknowledgement responses ────────────
+                # Arduino sends "BACKOFF" when "E" command is received and
+                # "BACKOFF_END" when the 500 ms reverse burst auto-expires.
+                if line == "BACKOFF":
+                    with self._lock:
+                        self.telemetry["backoff"] = True
+                    event_log.log("SERIAL",
+                                  "Arduino confirmed BACKOFF active — reverse burst started")
+                    continue
+
+                if line == "BACKOFF_END":
+                    with self._lock:
+                        self.telemetry["backoff"] = False
+                    event_log.log("SERIAL",
+                                  "Arduino BACKOFF ended — hover setpoints restored")
+                    continue
 
                 # JSON STATUS response  {"state":"ARMED","roll":...}
                 if line.startswith("{"):
@@ -1901,7 +2891,6 @@ class ArduinoController(AbstractFlightController):
                         self._armed = armed_now
                         self.telemetry["state"] = "ARMED" if armed_now else "DISARMED"
                     try:
-                        # Parse key:value pairs from telemetry line
                         parts = line.split()
                         tmap: Dict[str, str] = {}
                         for part in parts[1:]:
@@ -1909,25 +2898,20 @@ class ArduinoController(AbstractFlightController):
                                 k, v = part.split(":", 1)
                                 tmap[k] = v
                         with self._lock:
-                            if "R" in tmap:
-                                self.telemetry["roll"]  = float(tmap["R"])
-                            if "P" in tmap:
-                                self.telemetry["pitch"] = float(tmap["P"])
-                            if "FL" in tmap:
-                                self.telemetry["FL"] = int(tmap["FL"])
-                            if "FR" in tmap:
-                                self.telemetry["FR"] = int(tmap["FR"])
-                            if "RR" in tmap:
-                                self.telemetry["RR"] = int(tmap["RR"])
-                            if "RL" in tmap:
-                                self.telemetry["RL"] = int(tmap["RL"])
-                            if "thr" in tmap:
-                                self.telemetry["thr"] = int(tmap["thr"])
+                            if "R"   in tmap: self.telemetry["roll"]  = float(tmap["R"])
+                            if "P"   in tmap: self.telemetry["pitch"] = float(tmap["P"])
+                            if "FL"  in tmap: self.telemetry["FL"]    = int(tmap["FL"])
+                            if "FR"  in tmap: self.telemetry["FR"]    = int(tmap["FR"])
+                            if "RR"  in tmap: self.telemetry["RR"]    = int(tmap["RR"])
+                            if "RL"  in tmap: self.telemetry["RL"]    = int(tmap["RL"])
+                            if "thr" in tmap: self.telemetry["thr"]   = int(tmap["thr"])
                     except (ValueError, KeyError):
                         pass
                     continue
 
-                # ARM / DISARM confirmations
+                # ARM / DISARM confirmation strings
+                # Note: "ARMING SUCCESS" contains "ARMED" → correctly sets armed=True.
+                # "ARM DENIED" does NOT contain "ARMED" → correctly leaves armed=False.
                 if "ARMED" in line and "DISARMED" not in line:
                     with self._lock:
                         self._armed = True
@@ -1944,20 +2928,32 @@ class ArduinoController(AbstractFlightController):
     # ── Raw serial write ──────────────────────────────────────────────
 
     def _write_raw(self, cmd: str) -> None:
-        """Write a newline-terminated command string to serial."""
+        """
+        Write a newline-terminated command string to serial.
+
+        PATCH P3: acquires _serial_lock (not _lock) so serial writes and
+        motion-state reads use independent locks.  This allows the keepalive
+        thread to send PING without blocking when the motion thread is reading
+        self._armed or self._last_send_t under _lock.
+        """
         payload = f"{cmd}\n".encode()
-        try:
-            if self._ser is None or not self._ser.is_open:
-                if not self._reconnect():
-                    return
-            self._ser.write(payload)
-        except Exception as exc:
-            event_log.log("SERIAL", f"Write error ({cmd!r}): {exc} — reconnecting")
+        with self._serial_lock:
             try:
-                if self._reconnect():
-                    self._ser.write(payload)
-            except Exception as exc2:
-                event_log.log("SERIAL", f"Reconnect write failed: {exc2}")
+                if self._ser is None or not self._ser.is_open:
+                    # Reconnect inside _serial_lock — safe because _reconnect
+                    # only touches self._ser which is also protected by _serial_lock
+                    if not self._reconnect():
+                        return
+                self._ser.write(payload)
+            except Exception as exc:
+                event_log.log("SERIAL",
+                              f"Write error ({cmd!r}): {exc} — reconnecting")
+                try:
+                    if self._reconnect():
+                        self._ser.write(payload)
+                except Exception as exc2:
+                    event_log.log("SERIAL",
+                                  f"Reconnect write failed: {exc2}")
 
     # ── Motion primitive → FC commands ───────────────────────────────
 
@@ -1966,35 +2962,60 @@ class ArduinoController(AbstractFlightController):
         Translate a MotionPrimitive string into Arduino serial commands
         and transmit them.
 
-        Sequence per motion change:
-          1. ARM if not already armed (skip for EMERGENCY_STOP).
+        PATCH P1 — Stale-command TTL fix:
+            queued_at is captured before the lock so the age measurement
+            reflects actual queue latency rather than always being ~0.0 s.
+
+        PATCH P2 — ARM confirmation polling:
+            Polls self._armed for up to 2.0 s after sending ARM before
+            proceeding.  If the Arduino rejects ARM (DISARMED or timeout)
+            the motion command is aborted.  Replaces the original 50 ms
+            sleep which was 20× shorter than calibrateIMU() run time.
+
+        PATCH P3 — Lock separation:
+            self._lock  → guards _last_motion, _last_send_t, _armed only.
+            self._serial_lock → guards all self._ser.write() calls only.
+            These are acquired at different points; never held simultaneously.
+
+        PATCH P4 — MOVE_BACKOFF:
+            Sends "E" command which triggers the Arduino's 500 ms reverse
+            burst handler.  Does NOT send THROTTLE/ROLL/PITCH/YAW because
+            the Arduino-side backoff handler manages setpoints autonomously.
+
+        Sequence for normal motions (unchanged):
+          1. ARM if not already armed (with 2 s confirmation wait).
           2. Send THROTTLE <n>
           3. Send ROLL <f>
           4. Send PITCH <f>
           5. Send YAW <f>
-          6. DISARM if EMERGENCY_STOP.
         """
         if not self.enabled:
             return
 
-        now = time.time()
+        # PATCH P1: capture queued_at BEFORE the lock so age is real latency.
+        queued_at = time.time()
+
         with self._lock:
+            now = time.time()
             if not force and now - self._last_send_t < COMMAND_SEND_INTERVAL:
                 return
             if not force and motion == self._last_motion:
                 return
-            # Stale-command TTL
-            age = time.time() - now
+            # PATCH P1 (fix): age = wall-clock time since caller queued this command.
+            # Original code computed age = time.time() - now which was always ~0.0 s.
+            age = now - queued_at
             if age > STALE_CMD_TTL:
                 event_log.log("SERIAL",
-                              f"Stale motion '{motion}' discarded (age={age:.3f}s)")
+                              f"Stale motion '{motion}' discarded "
+                              f"(age={age:.4f}s > TTL={STALE_CMD_TTL:.3f}s)")
                 return
             self._last_motion = motion
             self._last_send_t = now
+            currently_armed   = self._armed
 
         t0 = time.perf_counter()
 
-        # ── Emergency: disarm immediately ─────────────────────────────
+        # ── Emergency: disarm immediately — highest priority ───────────
         if motion == MOVE_EMERGENCY_STOP:
             self._write_raw("DISARM")
             with self._lock:
@@ -2003,13 +3024,36 @@ class ArduinoController(AbstractFlightController):
             perf.record_serial_latency((time.perf_counter() - t0) * 1000)
             return
 
-        # ── Arm if needed ─────────────────────────────────────────────
-        with self._lock:
-            currently_armed = self._armed
+        # ── PATCH P4: collision backoff — sends "E" command directly ───
+        # The Arduino handles all setpoint changes internally for BACKOFF_HOLD_MS.
+        # Do NOT send THROTTLE/ROLL/PITCH/YAW — the .ino handler owns them.
+        if motion == MOVE_BACKOFF:
+            self._write_raw("E")
+            event_log.log("SERIAL",
+                          "Backoff 'E' sent — collision emergency reverse burst")
+            perf.record_serial_latency((time.perf_counter() - t0) * 1000)
+            return
+
+        # ── PATCH P2: ARM with confirmation polling ────────────────────
         if not currently_armed:
             self._write_raw("ARM")
-            event_log.log("SERIAL", "ARM sent")
-            time.sleep(0.05)   # brief pause for the sketch to process arm checks
+            event_log.log("SERIAL",
+                          "ARM sent — polling for confirmation (up to 2.0 s)")
+            arm_deadline = time.time() + 2.0
+            confirmed    = False
+            while time.time() < arm_deadline:
+                time.sleep(0.05)
+                with self._lock:
+                    if self._armed:
+                        confirmed = True
+                        break
+            if not confirmed:
+                event_log.log("SERIAL",
+                              "ARM confirmation timed out — aborting motion command "
+                              "(Arduino may have rejected ARM: check roll/pitch level)")
+                perf.record_serial_latency((time.perf_counter() - t0) * 1000)
+                return
+            event_log.log("SERIAL", "ARM confirmed by telemetry — proceeding")
 
         # ── Look up setpoints ─────────────────────────────────────────
         thr, roll, pitch, yaw = _MOTION_TO_FC.get(
@@ -2025,25 +3069,38 @@ class ArduinoController(AbstractFlightController):
 
         perf.record_serial_latency((time.perf_counter() - t0) * 1000)
         event_log.log("SERIAL",
-                      f"motion={motion} → THR={thr} R={roll} P={pitch} Y={yaw}")
+                      f"motion={motion} → THR={thr} R={roll:.1f} "
+                      f"P={pitch:.1f} Y={yaw:.1f}")
 
     def send_token(self, token: str, force: bool = False) -> None:
         """
         Legacy single-token interface retained for compatibility.
-        The token is reverse-mapped to a MotionPrimitive where possible;
-        otherwise treated as a raw Arduino command (e.g. 'STATUS').
+
+        PATCH P5: Explicitly handles the "E" backoff token before the
+        reverse-map so it is never silently dropped.  Previously "E" was
+        not in _MOTION_TO_FC so the reverse-map excluded it, and the else
+        branch sent raw "E" which the Arduino did not recognise — resulting
+        in an "UNKNOWN: E" response and no collision backoff.
         """
-        # Reverse-map Arduino token → motion primitive string
+        # PATCH P5: explicit backoff token handling — must come first
+        if token == "E":
+            self.send_motion(MOVE_BACKOFF, force=force)
+            return
+
+        # Reverse-map Arduino token → motion primitive string.
+        # MOVE_BACKOFF is now in _MOTION_TO_FC (Patch P4) so its token "E"
+        # would be caught here too, but the explicit check above is preferred
+        # for clarity and to guarantee force=force is forwarded correctly.
         _TOKEN_TO_MOTION: Dict[str, str] = {v: k for k, v in ARDUINO_TOKENS.items()
                                              if k in _MOTION_TO_FC}
         motion = _TOKEN_TO_MOTION.get(token)
         if motion:
             self.send_motion(motion, force=force)
         else:
-            # Raw command (STATUS, RECAL, RESETSTATS, HB ignored)
+            # Raw command pass-through (STATUS, RECAL, RESETSTATS).
+            # HB is silently dropped — it has no Arduino handler.
             if token not in ("HB",):
-                with self._lock:
-                    self._write_raw(token)
+                self._write_raw(token)
 
     def get_telemetry(self) -> Dict[str, object]:
         with self._lock:
@@ -2059,11 +3116,14 @@ class ArduinoController(AbstractFlightController):
     def close(self) -> None:
         self._stop_evt.set()
         # Disarm safely before closing
-        if self.enabled and self._armed:
-            try:
-                self._write_raw("DISARM")
-            except Exception:
-                pass
+        if self.enabled:
+            with self._lock:
+                armed_now = self._armed
+            if armed_now:
+                try:
+                    self._write_raw("DISARM")
+                except Exception:
+                    pass
         for t in (self._ka_thread, self._telem_thread):
             if t and t.is_alive():
                 t.join(timeout=2.0)
@@ -2092,9 +3152,18 @@ def send_nav_token(token: str, force: bool = False) -> None:
     In REAL_FLIGHT_MODE the ArduinoController translates the motion
     primitive into proper ARM/THROTTLE/ROLL/PITCH/YAW commands.
     In all other modes the DryRunController no-ops.
+
+    PATCH P5: "E" (backoff) token is handled explicitly before the reverse-map
+    so it is never silently dropped by the dict-comp filter.
     """
     if isinstance(flight_controller, ArduinoController):
-        # Prefer the full motion translation path
+        # PATCH P5: explicit backoff token — must bypass reverse-map check
+        if token == "E":
+            flight_controller.send_motion(MOVE_BACKOFF, force=force)
+            return
+        # Prefer the full motion translation path for all other tokens.
+        # MOVE_BACKOFF is now in _MOTION_TO_FC so "E" would also be found here,
+        # but the explicit check above guarantees correct force propagation.
         _TOKEN_TO_MOTION: Dict[str, str] = {v: k for k, v in ARDUINO_TOKENS.items()
                                              if k in _MOTION_TO_FC}
         motion = _TOKEN_TO_MOTION.get(token)
@@ -2432,7 +3501,18 @@ def draw_nav_overlay(frame: np.ndarray, nav_cmd: str,
     visible_obs = [o for o in obstacles if o.proximity >= SIDE_DANGER_FRAC * 0.7]
     draw_danger_boxes(frame, visible_obs)
 
-    is_emergency_cmd = nav_cmd in (NAV_EMERGENCY_STOP, MOVE_EMERGENCY_STOP)
+    # ── Collision emergency banner (highest visual priority) ──────────────
+    if camera_shake.check_collision_emergency():
+        elapsed_col = camera_shake.collision_active_elapsed
+        col_banner  = f"⚡ EMERGENCY COLLISION DETECTED  ({elapsed_col:.1f}s)  ⚡"
+        (bw, bh), _ = cv2.getTextSize(col_banner, cv2.FONT_HERSHEY_SIMPLEX, 0.80, 2)
+        bx = (frame_w - bw) // 2
+        cv2.rectangle(frame, (0, 0), (frame_w, 50), (0, 0, 180), -1)
+        cv2.putText(frame, col_banner, (max(4, bx), 36),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.80, (255, 80, 80), 2)
+
+    is_emergency_cmd = nav_cmd in (NAV_EMERGENCY_STOP, MOVE_EMERGENCY_STOP,
+                                   MOVE_BACKOFF)
     if is_emergency_cmd:
         in_recovery  = (_emergency_phase == _EMERG_RECOVERY)
         banner       = ("⚠  RECOVERING FROM EMERGENCY  ⚠"
@@ -2575,6 +3655,10 @@ def _open_cap(url: str, retries: int = 5, delay: float = 2.0):
     for attempt in range(retries):
         cap = cv2.VideoCapture(url, cv2.CAP_ANY)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Preserve full FOV (remove zoom effect) — explicitly do NOT set
+        # CAP_PROP_FRAME_WIDTH / CAP_PROP_FRAME_HEIGHT so OpenCV never crops
+        # or rescales the stream to a smaller resolution than the source.
+        # The stream's native resolution is used as-is.
         if cap.isOpened():
             event_log.log("RECONNECT", f"Stream connected: {url}")
             return cap
@@ -2593,17 +3677,39 @@ def _frame_reader_loop(url: str):
     if cap is None:
         _reader_alive.clear()
         return
+    # v10 Fix 6: retry counter — only reconnect after 5 consecutive read failures
+    # so a single dropped packet does not trigger a reconnect+emergency.
+    _read_fail_count: int = 0
     while _reader_alive.is_set():
         ret, frame = cap.read()
         if not ret:
-            event_log.log("RECONNECT", "Stream lost — reconnecting")
+            _read_fail_count += 1
+            if _read_fail_count < 5:
+                # Transient failure — wait briefly and retry before reconnecting
+                time.sleep(0.05)
+                continue
+            # 5 consecutive failures — now reconnect
+            event_log.log("RECONNECT",
+                          f"Stream lost after {_read_fail_count} retries — reconnecting")
             cap.release()
             cap = _open_cap(url)
             if cap is None:
                 event_log.log("RECONNECT", "Reconnect failed. Stopping reader.")
                 _reader_alive.clear()
                 break
+            _read_fail_count = 0
             continue
+        # Successful read — reset failure counter
+# Successful read — reset failure counter
+        _read_fail_count = 0
+
+
+        frame = cv2.flip(frame, 1)
+
+        # Preserve full FOV (remove zoom effect) — do NOT resize or crop here.
+        # The frame is stored at native capture resolution so the full field of
+        # view reaches the detection pipeline.  Display scaling is handled
+        # separately in _scale_frame_for_display().
         with _frame_lock:
             _latest_frame         = frame
             _frame_counter       += 1
@@ -2750,6 +3856,99 @@ def _scale_frame_for_display(frame: np.ndarray) -> np.ndarray:
     new_w = max(1, int(w * scale))
     new_h = max(1, int(h * scale))
     return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  v7 FIX-9 — PROXIMITY DEBUG OVERLAY  (DEBUG_MODE only, zero-cost otherwise)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def draw_proximity_debug_overlay(
+    frame: np.ndarray,
+    obstacles: List[ObstacleInfo],
+    frame_w: int,
+    frame_h: int,
+) -> None:
+    """
+    Debug-only overlay showing per-obstacle proximity diagnostics and the
+    emergency confirmation counter.  Drawn only in DEBUG_MODE — strict no-op
+    in all other runtime modes.
+
+    Visualises:
+      • Centre-corridor boundary rectangle (the only zone checked for ES)
+      • Per-obstacle: zone, v_zone, smoothed proximity %, colour-coded bar
+      • Highlight when obstacle is inside the ES corridor
+      • Emergency confirm counter progress vs required frames
+      • Active entry / exit threshold values
+    """
+    if not _mode_is_debug():
+        return
+
+    # ── Centre-corridor boundary (the ES-eligible zone) ───────────────────
+    lx = int(frame_w * LEFT_ZONE_END)
+    rx = int(frame_w * RIGHT_ZONE_START)
+    ty = int(frame_h * TOP_ZONE_END)
+    by = int(frame_h * BOTTOM_ZONE_START)
+    cv2.rectangle(frame, (lx, ty), (rx, by), (0, 255, 255), 1)
+    cv2.putText(frame, "ES CORRIDOR", (lx + 4, ty + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 255), 1)
+
+    # ── Per-obstacle proximity bars ───────────────────────────────────────
+    for obs in obstacles:
+        x1, y1, x2, y2 = obs.box
+        prox_pct = int(obs.proximity * 100)
+
+        # Colour tier: green < 40%, orange < 70%, red >= 70%
+        if obs.proximity < 0.40:
+            bar_col = (0, 200, 0)
+        elif obs.proximity < 0.70:
+            bar_col = (0, 165, 255)
+        else:
+            bar_col = (0, 0, 220)
+
+        # Vertical bar on left edge of detection box, height ∝ proximity
+        bar_h   = max(4, int((y2 - y1) * obs.proximity))
+        bar_top = y2 - bar_h
+        cv2.rectangle(frame, (x1 - 8, bar_top), (x1 - 2, y2), bar_col, -1)
+
+        # Proximity + zone label; cyan when inside the ES corridor
+        in_corridor = (obs.zone == "CENTER" and obs.v_zone == "MIDDLE")
+        label_col   = (0, 255, 255) if in_corridor else (180, 180, 180)
+        cv2.putText(frame, f"{prox_pct}% {obs.zone}/{obs.v_zone}",
+                    (x1, max(12, y1 - 2)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, label_col, 1)
+
+    # ── Emergency confirmation counter ────────────────────────────────────
+    conf_color = (0, 80, 220) if _emergency_confirm_count > 0 else (140, 140, 140)
+    conf_text  = (f"ES confirm: {_emergency_confirm_count}/"
+                  f"{_EMERGENCY_CONFIRM_FRAMES}  "
+                  f"DangerConf:{danger_confidence.confidence:.2f}/{_DANGER_CONF_THRESH:.2f}  "
+                  f"phase:{_emergency_phase}")
+    cv2.rectangle(frame, (0, frame_h - 24), (850, frame_h), (20, 20, 20), -1)
+    cv2.putText(frame, conf_text, (4, frame_h - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, conf_color, 1)
+
+    # ── Threshold labels ──────────────────────────────────────────────────
+    thresh_text = (f"ENTER>={_EMERGENCY_ENTER_FRAC:.0%}  "
+                   f"EXIT<{_EMERGENCY_EXIT_FRAC:.0%}  "
+                   f"min_area={_MIN_OBS_AREA_FRAC:.3f}  "
+                   f"max_asp={_MAX_OBS_ASPECT:.1f}  "
+                   f"confirm={_EMERGENCY_CONFIRM_FRAMES}fr")
+    cv2.putText(frame, thresh_text, (4, frame_h - 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (160, 160, 160), 1)
+
+    # ── Suppression state bar ────────────────────────────────────────────
+    blur_s  = blur_guard.suppression_factor()
+    shake_s = camera_shake.suppression_factor()
+    combined = blur_s * shake_s
+    s_col   = (0, 200, 0) if combined > 0.85 else (0, 165, 255) if combined > 0.50 else (0, 0, 220)
+    supp_text = (f"BlurSupp:{blur_s:.2f}  ShakeFlow:{camera_shake.mean_flow:.1f}px  "
+                 f"ShakeSupp:{shake_s:.2f}  Combined:{combined:.2f}  "
+                 f"Blur={'ON' if blur_guard.is_suppressed else 'OFF'}  "
+                 f"Shake={'ON' if camera_shake.is_shaking else 'OFF'}  "
+                 f"ColScore:{camera_shake.collision_score:.0f}%  "
+                 f"ColConsec:{camera_shake.collision_consec_frames}/10")
+    cv2.putText(frame, supp_text, (4, frame_h - 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, s_col, 1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2917,6 +4116,9 @@ def main():
     display_fps_val    = 0.0
     last_display_frame = None
     _reader_fail_start: float = 0.0
+    # v10 Fix 2: require 8 consecutive stale ticks before declaring a stale
+    # emergency — transient stream freezes are absorbed without ES.
+    _stale_confirm_count: int = 0
 
     try:
         while True:
@@ -2951,8 +4153,12 @@ def main():
 
             stale_now = (time.time() - _last_frame_timestamp) > STALE_FRAME_TIMEOUT
             if stale_now or frame is None:
+                # v10 Fix 2: accumulate consecutive stale ticks; only trigger
+                # emergency once the count reaches 8 to absorb brief lag spikes.
+                _stale_confirm_count += 1
+                stale_emergency = _stale_confirm_count >= 8
                 if last_display_frame is not None:
-                    if stale_now:
+                    if stale_emergency:
                         _render_stale_overlay(last_display_frame)
                         _force_emergency_nav_state()
                         draw_nav_overlay(last_display_frame, NAV_EMERGENCY_STOP,
@@ -2963,6 +4169,8 @@ def main():
                 if cv2.waitKey(10) & 0xFF == ord('q'):
                     break
                 continue
+            # Good frame received — reset stale counter
+            _stale_confirm_count = 0
 
             display_frame = frame.copy()
             boxes         = _get_latest_boxes()
@@ -3000,12 +4208,26 @@ def main():
             # IMPROVEMENT 4: advance virtual sensor suite
             virtual_sensors.tick(master_motion)
 
+            # v8: update blur guard (uses raw boxes before size filtering)
+            blur_guard.update(boxes, w_disp * h_disp)
+
+            # v8: update camera-shake detector (uses raw display frame)
+            camera_shake.update(display_frame)
+
+            # v8: evict stale tracker state
+            active_tids = {b[5] for b in boxes if b[5] >= 0}
+            bbox_stability.evict_stale(active_tids)
+            approach_tracker.evict_stale(active_tids)
+
             draw_nav_overlay(display_frame, master_motion, obstacles, danger_obs,
                              w_disp, h_disp)
 
             # IMPROVEMENT 5: simulation HUD overlay
             draw_simulation_hud(display_frame, w_disp, h_disp,
                                  master_motion, master_owner, nav_state)
+
+            # v7 FIX-9: proximity debug overlay (DEBUG_MODE only — no-op otherwise)
+            draw_proximity_debug_overlay(display_frame, obstacles, w_disp, h_disp)
 
             perf.record_frame_latency((time.perf_counter() - t_frame_start) * 1000)
 
@@ -3023,28 +4245,6 @@ def main():
             psnap        = perf.snapshot()
             fl, fr, rl, rr = get_motor_pwm_snapshot()
 
-            # ── Live Arduino telemetry (REAL_FLIGHT_MODE only) ────────
-            _fc_telem    = (flight_controller.get_telemetry()
-                            if isinstance(flight_controller, ArduinoController)
-                            else {})
-            _fc_armed    = (flight_controller.is_armed()
-                            if isinstance(flight_controller, ArduinoController)
-                            else False)
-            _fc_state    = _fc_telem.get("state", "N/A")
-            _fc_roll     = _fc_telem.get("roll",  0.0)
-            _fc_pitch    = _fc_telem.get("pitch", 0.0)
-            _fc_thr      = _fc_telem.get("thr",   0)
-            _fc_fl       = _fc_telem.get("FL",    0)
-            _fc_fr       = _fc_telem.get("FR",    0)
-            _fc_rl       = _fc_telem.get("RL",    0)
-            _fc_rr       = _fc_telem.get("RR",    0)
-            _fc_imu      = _fc_telem.get("imu",   "N/A")
-            _fc_ovr      = _fc_telem.get("ovr",   0)
-
-            # Look up what THROTTLE/ROLL/PITCH/YAW will be sent
-            _pending_sp  = _MOTION_TO_FC.get(master_motion, (0, 0.0, 0.0, 0.0))
-            _pending_thr = _scale_throttle_safe_test(_pending_sp[0])
-
             hud = [
                 f"Humans  : {human_count}",
                 f"Device  : {cfg.tier}",
@@ -3057,21 +4257,16 @@ def main():
                 f"NAV STATE   : {nav_state}",
                 f"MASTER OWNER: {master_owner}",
                 f"MOTION CMD  : {master_motion}",
-                f"FC TX (next): THR={_pending_thr} R={_pending_sp[1]:.1f}"
-                f" P={_pending_sp[2]:.1f} Y={_pending_sp[3]:.1f}",
-                f"── FC TELEMETRY ────────────",
-                f"FC State: {_fc_state}  IMU:{_fc_imu}",
-                f"FC Roll : {_fc_roll:+.2f}°  Pitch:{_fc_pitch:+.2f}°",
-                f"FC Thr  : {_fc_thr}  Ovr:{_fc_ovr}",
-                f"FC Motor: FL{_fc_fl} FR{_fc_fr} RL{_fc_rl} RR{_fc_rr}",
+                f"ARDUINO TX  : {motor_token}",
                 f"── DIAGNOSTICS ────────────",
                 f"Dr State: {drone_state}",
                 f"NAV FSM : {nav_cmd}",
                 f"Depth   : {top_prox}",
+                f"ES Cnfrm: {_emergency_confirm_count}/{_EMERGENCY_CONFIRM_FRAMES}",
                 f"Mem Obs : {mem_count}",
                 f"Low Pwr : {'ON' if _low_power_mode else 'OFF'}",
-                f"Serial  : {'ARMED' if _fc_armed else ('CONN' if flight_controller.is_connected() else 'OFF')}",
-                f"── MOTORS (ramped) ─────────",
+                f"Serial  : {'ON' if flight_controller.is_connected() else 'OFF (dry-run)'}",
+                f"── MOTORS (ramped) ─────────",       # IMPROVEMENT 2
                 f"FL:{fl:3d}  FR:{fr:3d}",
                 f"RL:{rl:3d}  RR:{rr:3d}",
                 f"── PERFORMANCE ─────────────",

@@ -6,27 +6,30 @@ from twilio.rest import Client
 with open("config.json", "r") as file:
     config = json.load(file)
 
-with open("../camera_ana/human_count.txt", "r") as file:
-    human_count = file.read().strip()
-
 # Twilio credentials
-account_sid = config["account_sid"]
-auth_token = config["auth_token"]
+client = Client(
+    config["account_sid"],
+    config["auth_token"]
+)
 
 FROM_WHATSAPP = "whatsapp:" + config["FROM_WHATSAPP"]
 TO_WHATSAPP = "whatsapp:" + config["TO_WHATSAPP"]
 
-# Create client
-client = Client(account_sid, auth_token)
-
-# Send message
 while True:
-    message = client.messages.create(
-        from_=FROM_WHATSAPP,
-        body=f"🚨 ALERT: {human_count} Human detected by drone in the frame!",
-        to=TO_WHATSAPP
-    )
+    try:
+        with open("../nanodrone_auto/human_count.txt", "r") as file:
+            human_count = file.read().strip()
 
-    print("Message sent!")
-    print("SID:", message.sid)
+        message = client.messages.create(
+            from_=FROM_WHATSAPP,
+            body=f"🚨 ALERT: {human_count} human(s) detected by drone!",
+            to=TO_WHATSAPP
+        )
+
+        print(f"Message sent! Count = {human_count}")
+        print("SID:", message.sid)
+
+    except Exception as e:
+        print("Error:", e)
+
     time.sleep(120)
